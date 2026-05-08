@@ -13,16 +13,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from PhyCoFlowModel.helpers import TurbulentCombustionH5Dataset, visualize_reconstruction
+from helpers import TurbulentCombustionH5Dataset, visualize_reconstruction
 
-from PhyCoFlowModel.Model import (
+from Model import (
     ConditionalPointMLPRBF,
     ConditionalPointPerceiver,
     ConditionalPointHybridLocalGlobalRBF,
     PointCloudFFM,
 )
 try:
-    from PhyCoFlowModel.Model import FNO, FNOFFM
+    from Model import FNO, FNOFFM
 except ImportError:
     FNO = None
     FNOFFM = None
@@ -58,6 +58,12 @@ def parse_args():
     p.add_argument("--save-analysis-npz", action="store_true",
                    help="If set, save per-field intermediate arrays (grids, gradients, spectra) to .npz files.",
     )
+    # CODE THAT WAS ADDED TO HELP WITH COHERENCE METRIC
+    p.add_argument("--save-coherence-npz", action="store_true",
+                   help="If set, save raw reconstruction/target arrays needed for graph coherence plots.")
+    
+    p.add_argument("--run-timestamp", type=str, default=None,
+                    help="Optional timestamp for a specific run, e.g. 20260418_170749.")
 
     return p.parse_args()
 
@@ -621,11 +627,23 @@ def main():
     demo_root = Path(args.demo_root).resolve()
     cfg_dir = demo_root / "Save_config" / "pointcloud_ffm"
 
-    try:
-        yaml_path = _find_latest_yaml(cfg_dir, args.Demo_Num)
-    except FileNotFoundError as e:
-        print(f"[Warning: !] {e}")
-        raise SystemExit(1)
+    # try:
+    #     yaml_path = _find_latest_yaml(cfg_dir, args.Demo_Num)
+    # except FileNotFoundError as e:
+    #     print(f"[Warning: !] {e}")
+    #     raise SystemExit(1)
+    # CHANGED FOR COHERENCE METRIC
+    if args.run_timestamp is not None:
+        yaml_path = cfg_dir / f"config_pointcloud_ffm_DemoN{args.Demo_Num}_{args.run_timestamp}.yaml"
+        if not yaml_path.exists():
+            print(f"[Warning: !] Config file not found: {yaml_path}")
+            raise SystemExit(1)
+    else:
+        try:
+            yaml_path = _find_latest_yaml(cfg_dir, args.Demo_Num)
+        except FileNotFoundError as e:
+            print(f"[Warning: !] {e}")
+            raise SystemExit(1)
 
     with open(yaml_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
@@ -706,7 +724,13 @@ def main():
     out_dir = demo_root / "Save_reconstruction_files" / "ForOfflineEvaluation" / f"eval_N{args.Demo_Num}_{eval_timestamp}_from_{train_timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    need_payload = (len(args.extra_metrics) > 0) or args.save_analysis_npz
+    # need_payload = (len(args.extra_metrics) > 0) or args.save_analysis_npz
+    # REPLACED FOR COHERENCE METRIC
+    need_payload = (
+        (len(args.extra_metrics) > 0)
+        or args.save_analysis_npz
+        or args.save_coherence_npz
+    )
     result = visualize_reconstruction(
         model=model,
         dataset=dataset,
@@ -729,6 +753,40 @@ def main():
         payload = None
 
     extra_metrics = {}
+
+    # ADDED FOR COHERENCE METRIC
+    if args.save_coherence_npz:
+        if payload is None:
+            print("[Warning: !] Could not save coherence NPZ because payload is None.")
+        else:
+            prefix = f"snapshot_{args.snapshot_index:04d}"
+
+            truth_phys = payload["truth_phys"]   # expected shape: [N, C]
+            recon_phys = payload["recon_phys"]   # expected shape: [N, C]
+            field_names = np.asarray(payload["field_names"])
+
+            # Most current payloads expose 2D plotting coordinates.
+            # This is still valid for graph construction if the point cloud lives in x-y.
+            coords = payload["coords_xy"]        # expected shape: [N, 2]
+
+            coherence_npz_path = out_dir / f"{prefix}_coherence_raw.npz"
+
+            np.savez_compressed(
+                coherence_npz_path,
+                fields_target=truth_phys,
+                fields_pred=recon_phys,
+                coords=coords,
+                field_names=field_names,
+                snapshot_index=np.asarray(args.snapshot_index),
+                split=np.asarray(args.split),
+                n_steps_generation=np.asarray(n_steps_generation),
+                checkpoint=np.asarray(str(ckpt_path)),
+            )
+
+            print(f"[*] Saved coherence raw arrays: {coherence_npz_path}")
+            print(f"    fields_target shape: {truth_phys.shape}")
+            print(f"    fields_pred shape   : {recon_phys.shape}")
+            print(f"    coords shape        : {coords.shape}")   
 
     if payload is not None and len(args.extra_metrics) > 0:
         try:
