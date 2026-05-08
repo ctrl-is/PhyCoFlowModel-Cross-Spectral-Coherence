@@ -1,8 +1,3 @@
-# Code for defining cross-spectral coherence
-
-# This will define parts 1.4-___ of our term.
-
-
 import torch
 import torch.nn as nn
 import numpy as np
