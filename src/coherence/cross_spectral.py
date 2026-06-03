@@ -5,31 +5,34 @@ from dataclasses import dataclass
 
 def gft(fields, U):
     """
-    Project physical fields into graph-frequency space.
-
-    Implements: hat{x}^(c) = U^T x^(c) for all fields and batch elements.
-
-    The einsum contracts over the spatial dimension n:
-        U is [N, K], fields is [B, N, C]
-        Result is [B, K, C]
-
-    Each output element gft[b, k, c] tells you the amplitude of the kth
-    graph frequency mode in the c-th physical field of the b-th sample.
+    Project fields into graph-frequency space.
 
     Args:
-        fields: [B, N, C] — batch of multi-field snapshots - torch.Tensor
-        U:      [N, K]    — graph Fourier basis (computed previously, it is fixed) - torch.Tensor
+        fields: [B, N, C] or [B, Q, C].
+        U: [N, K] full basis or [B, Q, K] sampled basis.
 
     Returns:
-        [B, K, C] — our graph Fourier coefficients
+        [B, K, C] graph Fourier coefficients.
     """
-    N_u = U.shape[0]
-    N_f = fields.shape[1]
-    if N_u != N_f:
-        raise ValueError(
-            f"Spatial dimension mismatch: U has {N_u} nodes but fields have {N_f} points. The GFT requires the full unsubsampled field."
+    if U.ndim == 2:
+        N_u = U.shape[0]
+        N_f = fields.shape[1]
+        if N_u != N_f:
+            raise ValueError(
+                f"Spatial dimension mismatch: U has {N_u} nodes but fields have {N_f} points. The GFT requires the full unsubsampled field."
             )
-    return torch.einsum("nk,bnc->bkc", U, fields)
+        return torch.einsum("nk,bnc->bkc", U, fields)
+    
+    if U.ndim == 3:
+        B_u, N_u, _ = U.shape
+        B_f, N_f, _ = fields.shape
+        if B_u != B_f or N_u != N_f:
+            raise ValueError(
+                f"Batched U mismatch: U has shape {tuple(U.shape)}, fields have shape {tuple(fields.shape)}."
+            )
+        return torch.einsum("bnk,bnc->bkc", U, fields)
+    
+    raise ValueError(f"U must have shape [N, K] or [B, N, K], got {tuple(U.shape)}.")
 
 def inverse_graph_fourier_transform(gft_coeffs, U):
     """
