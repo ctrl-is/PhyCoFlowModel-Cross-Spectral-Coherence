@@ -47,6 +47,10 @@ from Model import (
     FNOFFM,
     )
 
+# imports for cross-spectral coherence
+from coherence.cross_spectral import CrossSpectralConfig
+from coherence.graph import make_graph_frequency_bands
+
 def parse_args():
 
     p = argparse.ArgumentParser("Train a starter conditional point-cloud FFM on turbulent combustion HDF5 data.")
@@ -200,6 +204,18 @@ def parse_args():
     p.add_argument("--cond-field", type=int, default=2, help="Legacy single conditioned field.")
     p.add_argument("--n-obs-min", type=int, default=64, help="Legacy single-field minimum sensors.")
     p.add_argument("--n-obs-max", type=int, default=256, help="Legacy single-field maximum sensors.")
+
+    # ------------------------------
+    # These are hyperparameters for coherence-loss | part of the training loss
+    # ------------------------------
+    p.add_argument("--lambda-coh", type=float, default=0.0,
+                   help="Weight for cross-spectral coherence loss.")
+    p.add_argument("--graph-basis-path", type=str, default=None,
+                   help="Path to saved graph basis with eigenvalues and U.")
+    p.add_argument("--coherence-eps", type=float, default=1e-8,
+                   help="Numerical epsilon for coherence denominator.")
+    p.add_argument("--coherence-eps-ratio", type=float, default=1e-12,
+                   help="Numerical epsilon for band-ratio logging.")
 
     # generalized args
     p.add_argument("--cond-fields", type=int, nargs="+", default=None,
@@ -390,6 +406,10 @@ def run_epoch(
     query_sample_far_ratio: float = 0.25,
     query_sample_sigma_ratio: float = 0.05,
     epoch: int = 0,
+    spectral_U=None,
+    spectral_bands=None,
+    lambda_coh=0.0,
+    spectral_cfg=None,
 ) -> float:
     training = optimizer is not None
     model.train(training)
@@ -417,7 +437,7 @@ def run_epoch(
         # point subsampling will be disabled.
         effective_n_query = None if getattr(model, "requires_full_grid", False) else n_query_points
         sampling_mode = query_sampling if training else "uniform"
-        coords_q, fields_q, _ = sample_query_subset(
+        coords_q, fields_q, query_idx = sample_query_subset(
             coords=coords_full,
             fields=fields_full,
             n_query=effective_n_query,
@@ -428,6 +448,14 @@ def run_epoch(
             far_ratio=query_sample_far_ratio,
             sigma_ratio=query_sample_sigma_ratio,
         )
+        spectral_U_q = None
+
+        if spectral_U is not None and float(lambda_coh) > 0.0:
+            if query_idx is None:
+                spectral_U_q = spectral_U
+            else:
+                query_idx = query_idx.to(device=spectral_U.device, dtype=torch.long)
+                spectral_U_q = spectral_U[query_idx]
 
         loss, _ = model.training_loss(
             x1=fields_q,
@@ -437,6 +465,10 @@ def run_epoch(
             obs_mask=obs_mask,
             obs_field_ids=obs_field_ids,
             obs_indices=obs_indices,
+            spectral_U=spectral_U_q,
+            spectral_bands=spectral_bands,
+            lambda_coh=lambda_coh,
+            spectral_cfg=spectral_cfg,
         )
 
         if training:
@@ -658,6 +690,36 @@ def main():
     device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
+    # Addition of cross-spectral coherence
+    spectral_U = None
+    spectral_bands = None
+    spectral_cfg = None
+
+    if float(args.lambda_coh) > 0.0:
+        if args.graph_basis_path is None:
+            raise ValueError("--graph-basis-path is required when --lambda-coh > 0.")
+
+        graph_basis_path = Path(args.graph_basis_path)
+        if not graph_basis_path.is_absolute():
+            graph_basis_path = Path(demo_dir) / graph_basis_path
+
+        basis = torch.load(graph_basis_path, map_location="cpu")
+
+        eigenvalues = basis["eigenvalues"]
+        spectral_U = basis["U"].to(device=device, dtype=torch.float32)
+        spectral_bands = make_graph_frequency_bands(eigenvalues)
+
+        spectral_cfg = CrossSpectralConfig(
+            eps=args.coherence_eps,
+        )
+        spectral_cfg.eps_ratio = args.coherence_eps_ratio
+
+        print("[*] Cross-spectral coherence loss enabled.")
+        print(f"[*] lambda_coh = {args.lambda_coh}")
+        print(f"[*] graph_basis_path = {graph_basis_path}")
+        print(f"[*] U shape = {tuple(spectral_U.shape)}")
+        print(f"[*] bands = { {k: len(v) for k, v in spectral_bands.items()} }")
+
     train_set = TurbulentCombustionH5Dataset(
         args.data,
         split="train",
@@ -843,6 +905,10 @@ def main():
             query_sample_far_ratio=args.query_sample_far_ratio,
             query_sample_sigma_ratio=args.query_sample_sigma_ratio,
             epoch=epoch,
+            spectral_U=spectral_U,
+            spectral_bands=spectral_bands,
+            lambda_coh=args.lambda_coh,
+            spectral_cfg=spectral_cfg,
         )
         scheduler.step()
 
@@ -864,6 +930,10 @@ def main():
                     query_sample_far_ratio=args.query_sample_far_ratio,
                     query_sample_sigma_ratio=args.query_sample_sigma_ratio,
                     epoch=epoch,
+                    spectral_U=spectral_U,
+                    spectral_bands=spectral_bands,
+                    lambda_coh=args.lambda_coh,
+                    spectral_cfg=spectral_cfg,
                 )
             print(f"[valid] epoch={epoch:04d} loss={val_loss:.6e}")
 
