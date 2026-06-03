@@ -3,7 +3,6 @@ import torch.nn as nn
 import numpy as np
 from dataclasses import dataclass
 
-
 def gft(fields, U):
     """
     Project physical fields into graph-frequency space.
@@ -65,6 +64,7 @@ def estimate_auto_spectra(gft_coeffs):
         [K, C] — auto_spectra[k, c] = average energy of field c at frequency k
     """
     return (gft_coeffs ** 2).mean(dim=0)
+
 def estimate_cross_spectra(gft_coeffs):
     """
     Graph cross-spectral density: the shared structure between field pairs.
@@ -115,6 +115,7 @@ class CrossSpectralConfig:
 
     # Coherence computation
     eps: float = 1e-8
+    eps_ratio: float = 1e-12
 
     # Loss weights (Section 4.7: L_spectral = λ_coh * L_coh + λ_cross * L_cross + λ_auto * L_auto)
     lambda_coh: float = 1.0
@@ -127,7 +128,7 @@ class CrossSpectralConfig:
 
 # Loss Functions (Sections 4.6-4.7)
 
-def coherence_matching_loss(coherence_pred, coherence_target, field_pairs = None):
+def coherence_matching_loss(coherence_pred, coherence_target, field_pairs=None):
     """
     L_coh = (1/|pairs|) sum_{c1<c2} || c^pred_{c1,c2} - c^data_{c1,c2} ||^2
 
@@ -150,7 +151,7 @@ def coherence_matching_loss(coherence_pred, coherence_target, field_pairs = None
     return loss / len(field_pairs)
 
 
-def cross_spectrum_matching_loss(cross_spectra_pred, cross_spectra_target, field_pairs = None):
+def cross_spectrum_matching_loss(cross_spectra_pred, cross_spectra_target, field_pairs=None):
     """
     L_cross = (1/|pairs|) sum_{c1<c2} || p^pred_{c1,c2} - p^data_{c1,c2} ||^2
 
@@ -173,7 +174,7 @@ def cross_spectrum_matching_loss(cross_spectra_pred, cross_spectra_target, field
     return loss / len(field_pairs)
 
 
-def auto_spectrum_matching_loss(auto_spectra_pred,auto_spectra_target):
+def auto_spectrum_matching_loss(auto_spectra_pred, auto_spectra_target):
     """
     L_auto = (1/C) sum_c || p^pred_c - p^data_c ||^2
 
@@ -187,7 +188,7 @@ def combined_spectral_loss(
     fields_pred: torch.Tensor,
     fields_target: torch.Tensor,
     U: torch.Tensor,
-    cfg = None):
+    cfg=None):
     """
     Full spectral regularizer (Section 4.7):
         L_spectral = λ_coh * L_coh + λ_cross * L_cross + λ_auto * L_auto
@@ -246,7 +247,78 @@ def combined_spectral_loss(
         "coherence_target": coh_target.detach(),
     }
 
+def compute_cross_spectral_coherence_loss(fields_pred,
+    fields_target,
+    U,
+    bands=None,
+    cfg=None):
+    """
+    Compute graph coherence loss and optional band decomposition.
 
+    Args:
+        fields_pred: [B, N, C] predicted full fields.
+        fields_target: [B, N, C] target full fields.
+        U: [N, K] graph Fourier basis.
+        bands: Optional dict of frequency-band indices.
+        cfg: Optional CrossSpectralConfig.
+
+    Returns:
+        Dict containing L_coh, diagnostics, and band losses.
+    """
+    cfg = cfg or CrossSpectralConfig()
+
+    gft_pred = gft(fields_pred, U)
+    gft_target = gft(fields_target, U)
+
+    auto_pred = estimate_auto_spectra(gft_pred)
+    auto_target = estimate_auto_spectra(gft_target)
+
+    cross_pred = estimate_cross_spectra(gft_pred)
+    cross_target = estimate_cross_spectra(gft_target)
+
+    coh_pred = compute_coherence(auto_pred, cross_pred, eps=cfg.eps)
+    coh_target = compute_coherence(auto_target, cross_target, eps=cfg.eps)
+
+    L_coh = coherence_matching_loss(coh_pred, coh_target, cfg.field_pairs)
+
+    # Optional diagnostics from original paper, not the main updated training loss yet
+    L_cross = cross_spectrum_matching_loss(cross_pred, cross_target, cfg.field_pairs)
+    L_auto = auto_spectrum_matching_loss(auto_pred, auto_target)
+
+    # Optional low/mid/high decomposition of the same coherence loss.
+    band_losses = {}
+    band_ratios = {}
+
+    if bands is not None:
+        for band_name, band_idx in bands.items():
+            band_idx = torch.as_tensor(
+                band_idx,
+                device=coh_pred.device,
+                dtype=torch.long,
+            )
+
+            coh_pred_band = coh_pred[band_idx, :, :]
+            coh_target_band = coh_target[band_idx, :, :]
+
+            L_band = coherence_matching_loss(
+                coh_pred_band,
+                coh_target_band,
+                cfg.field_pairs,
+            )
+
+            band_losses[band_name] = L_band
+            band_ratios[band_name] = L_band / (L_coh + cfg.eps_ratio)
+
+    return {
+        "loss": L_coh,
+        "L_coh": L_coh,
+        "L_cross": L_cross,
+        "L_auto": L_auto,
+        "band_losses": band_losses,
+        "band_ratios": band_ratios,
+        "coh_pred": coh_pred,
+        "coh_target": coh_target,
+    }
 
 
 

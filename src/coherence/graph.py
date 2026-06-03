@@ -135,4 +135,33 @@ def spectral_decomposition(L, num_modes = 256):
 
     return eigenvals, U
 
+def make_graph_frequency_bands(eigenvalues, exclude_zero=True, split="thirds"):
+    """
+    Split sorted graph frequencies into low/mid/high index bands.
+
+    Args:
+        eigenvalues: [K] sorted graph Laplacian eigenvalues.
+        exclude_zero: If True, skip the constant/zero mode.
+        split: Frequency split rule. Currently supports "thirds".
+
+    Returns:
+        Dict mapping band names to frequency-mode indices.
+    """
+    valid_modes = np.arange(len(eigenvalues))
+
+    if exclude_zero:
+        valid_modes = valid_modes[1:]
+
+    n = len(valid_modes)
+    first_cut = n // 3
+    second_cut =  2 * n // 3
+
+    bands = {
+        "low": valid_modes[:first_cut],
+        "mid": valid_modes[first_cut:second_cut],
+        "high": valid_modes[second_cut:]
+    }
+
+    return bands
+
 
