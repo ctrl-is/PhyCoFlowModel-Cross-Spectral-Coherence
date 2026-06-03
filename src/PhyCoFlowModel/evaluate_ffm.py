@@ -1,3 +1,14 @@
+"""
+Sparse-observation consistency usage:
+
+- default_hard is the default and preserves current pointwise hard replacement behavior.
+- endpoint applies rectified-flow clean-endpoint pointwise observation masking.
+- endpoint_smooth applies rectified-flow clean-endpoint Gaussian/RBF smooth observation masking.
+- All added SenConsis outputs are saved under SenConsis/, 
+                 activate this using --obs-consistency-mode & visualize by --save-obs-consistency-plots.
+- SenConsis metrics are relative L2 sensor-consistency errors.
+"""
+
 import argparse
 import json
 import os
@@ -13,7 +24,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from helpers import TurbulentCombustionH5Dataset, visualize_reconstruction
+from helpers import (
+    TurbulentCombustionH5Dataset,
+    save_obs_consistency_comparison,
+    validate_regular_grid_compatibility,
+    visualize_reconstruction,
+)
 
 from Model import (
     ConditionalPointMLPRBF,
@@ -28,7 +44,10 @@ except ImportError:
     FNOFFM = None
 
 def parse_args():
-    p = argparse.ArgumentParser("Standalone evaluator for trained FFM models.")
+    p = argparse.ArgumentParser(
+        "Standalone evaluator for trained FFM models.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     p.add_argument("--Demo-Num", dest="Demo_Num", type=int, required=True, 
                    help="Demo ID to recover.")
     p.add_argument("--demo-root", type=str, default=".", 
@@ -47,6 +66,12 @@ def parse_args():
                    help="Which checkpoint to load from the recovered run directory.")
     p.add_argument("--n-steps-generation", type=int, default = 4,
                    help="Override generation steps. Defaults to YAML n_steps_generation if present.")
+    p.add_argument(
+        "--ode-solver",
+        choices=["euler", "heun"],
+        default=None,
+        help="ODE solver for generation. Defaults to YAML ode_solver, then euler.",
+    )
     p.add_argument("--device", type=str, default=None, help="e.g. cuda:0 or cpu")
     
     # Added extra metrics for evaluation
@@ -58,12 +83,32 @@ def parse_args():
     p.add_argument("--save-analysis-npz", action="store_true",
                    help="If set, save per-field intermediate arrays (grids, gradients, spectra) to .npz files.",
     )
-    # CODE THAT WAS ADDED TO HELP WITH COHERENCE METRIC
-    p.add_argument("--save-coherence-npz", action="store_true",
-                   help="If set, save raw reconstruction/target arrays needed for graph coherence plots.")
-    
-    p.add_argument("--run-timestamp", type=str, default=None,
-                    help="Optional timestamp for a specific run, e.g. 20260418_170749.")
+    p.add_argument(
+        "--obs-consistency-mode",
+        choices=["none", "default_hard", "endpoint", "endpoint_smooth"],
+        default="default_hard",
+        help="Sparse-observation consistency mode used during sampling.",
+    )
+    p.add_argument("--obs-consistency-strength", type=float, default=1.0)
+    p.add_argument("--obs-consistency-sigma", type=float, default=0.05)
+    p.add_argument("--obs-consistency-schedule-power", type=float, default=2.0)
+    p.add_argument(
+        "--no-obs-consistency-final-clamp",
+        action="store_true",
+        help="Disable the final exact sensor clamp for observation-consistency modes.",
+    )
+    p.add_argument(
+        "--save-obs-consistency-plots",
+        action="store_true",
+        help="Save SenConsis metrics and sensor-consistency figures.",
+    )
+    p.add_argument(
+        "--obs-consistency-compare-modes",
+        nargs="+",
+        default=None,
+        choices=["none", "default_hard", "endpoint", "endpoint_smooth"],
+        help="Evaluate multiple sparse-observation consistency modes using the same sensor set.",
+    )
 
     return p.parse_args()
 
@@ -184,6 +229,9 @@ def _build_model(cfg: dict, dataset) -> torch.nn.Module:
             n_modes_y=cfg.get("fno_modes_y", 8),
             hidden_channels=cfg.get("fno_hidden_channels", 64),
             n_layers=cfg.get("fno_n_layers", 4),
+            condition_blur=cfg.get("condition_blur", False),
+            condition_blur_kernel=cfg.get("condition_blur_kernel", 5),
+            condition_blur_sigma=cfg.get("condition_blur_sigma", 1.0),
         )
         model = FNOFFM(backbone, prior, sigma_min=cfg.get("sigma_min", 1e-4))
         return model
@@ -213,6 +261,9 @@ def _build_model(cfg: dict, dataset) -> torch.nn.Module:
 
             sensor_local_topk=cfg.get("sensor_local_topk", 32),
             sensor_local_dropout=cfg.get("sensor_local_dropout", 0.0),
+            use_fourier_pe=cfg.get("USE_FOURIER_PE", False),
+            fourier_pe_num_bands=cfg.get("fourier_pe_num_bands", 32),
+            fourier_pe_max_freq=cfg.get("fourier_pe_max_freq", 64.0),
         )
         model = PointCloudFFM(backbone, prior, sigma_min=cfg.get("sigma_min", 1e-4))
         return model
@@ -224,6 +275,9 @@ def _build_model(cfg: dict, dataset) -> torch.nn.Module:
         cond_dim=cfg.get("cond_dim", 128),
         field_embed_dim=cfg.get("field_embed_dim", 128),
         rbf_sigma=cfg.get("rbf_sigma", 0.05),
+        use_fourier_pe=cfg.get("USE_FOURIER_PE", False),
+        fourier_pe_num_bands=cfg.get("fourier_pe_num_bands", 32),
+        fourier_pe_max_freq=cfg.get("fourier_pe_max_freq", 64.0),
     )
     model = PointCloudFFM(backbone, prior, sigma_min=cfg.get("sigma_min", 1e-4))
 
@@ -621,29 +675,27 @@ def _save_band_energy_plot(
     fig.savefig(save_path, dpi=220)
     plt.close(fig)
 
+
+def _mean_full_field_relative_l2(metrics: dict) -> float:
+    values = []
+    for key, value in metrics.items():
+        if key.startswith("obs_"):
+            continue
+        if isinstance(value, (int, float)) and np.isfinite(value):
+            values.append(float(value))
+    return float(np.mean(values)) if values else float("nan")
+
 def main():
     args = parse_args()
 
     demo_root = Path(args.demo_root).resolve()
     cfg_dir = demo_root / "Save_config" / "pointcloud_ffm"
 
-    # try:
-    #     yaml_path = _find_latest_yaml(cfg_dir, args.Demo_Num)
-    # except FileNotFoundError as e:
-    #     print(f"[Warning: !] {e}")
-    #     raise SystemExit(1)
-    # CHANGED FOR COHERENCE METRIC
-    if args.run_timestamp is not None:
-        yaml_path = cfg_dir / f"config_pointcloud_ffm_DemoN{args.Demo_Num}_{args.run_timestamp}.yaml"
-        if not yaml_path.exists():
-            print(f"[Warning: !] Config file not found: {yaml_path}")
-            raise SystemExit(1)
-    else:
-        try:
-            yaml_path = _find_latest_yaml(cfg_dir, args.Demo_Num)
-        except FileNotFoundError as e:
-            print(f"[Warning: !] {e}")
-            raise SystemExit(1)
+    try:
+        yaml_path = _find_latest_yaml(cfg_dir, args.Demo_Num)
+    except FileNotFoundError as e:
+        print(f"[Warning: !] {e}")
+        raise SystemExit(1)
 
     with open(yaml_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
@@ -677,18 +729,32 @@ def main():
         stats_path=str(model_root / "dataset_stats.pt"),
     )
 
+    if cfg.get("backbone") == "fno":
+        grid_info = validate_regular_grid_compatibility(dataset, cfg.get("Num_x", None), cfg.get("Num_y", None))
+        print(
+            "[*] FNO grid detected: "
+            f"{grid_info['unique_x']} unique x values x {grid_info['unique_y']} unique y values "
+            f"= {grid_info['num_points']} points."
+        )
+        if grid_info["requires_permutation"]:
+            print(
+                "[*] FNO grid order: dataset is not row-major; the FNO backbone will "
+                "apply its coordinate-derived permutation during evaluation."
+            )
+
     try:
-        model = _build_model(cfg, dataset).to(device)
+        # Build and restore on CPU first to avoid temporarily holding both the
+        # checkpoint tensors and the live model weights on the target device.
+        model = _build_model(cfg, dataset)
     except Exception as e:
         print(f"[Warning: !] Model construction failed: {e}")
         raise SystemExit(1)
 
-    # ckpt = torch.load(ckpt_path, map_location=device)
     try:
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
     except pickle.UnpicklingError:
         print("[Warning: !] Restricted torch.load failed; retrying with weights_only=False for a trusted local checkpoint.")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
 
@@ -702,8 +768,20 @@ def main():
         model.load_state_dict(state_dict, strict=True)
     except Exception as e:
         print(f"[Warning: !] Checkpoint is incompatible with the reconstructed model: {e}")
+        if cfg.get("backbone") == "fno":
+            print(
+                "[Warning: !] FNO conditioning now uses normalized, support-weighted, "
+                "and soft-support channels (4 * n_fields + 1 inputs). Older FNO "
+                "checkpoints trained with the previous 3 * n_fields + 1 input layout "
+                "must be retrained."
+            )
         raise SystemExit(1)
 
+    epoch = int(ckpt.get("epoch", 0)) if isinstance(ckpt, dict) else 0
+    del state_dict
+    del ckpt
+
+    model = model.to(device)
     model.eval()
 
     vis_cond_fields = args.vis_cond_fields if args.vis_cond_fields is not None else cfg["vis_cond_fields"]
@@ -715,7 +793,10 @@ def main():
         args.n_steps_generation if args.n_steps_generation is not None
         else cfg.get("n_steps_generation", 100)
     )
-    print(f'\nResults are generated from n_steps={n_steps_generation}\n')
+    ode_solver = args.ode_solver if args.ode_solver is not None else cfg.get("ode_solver", "euler")
+    if ode_solver not in ("euler", "heun"):
+        raise ValueError(f"Unsupported ode_solver={ode_solver!r}; expected 'euler' or 'heun'.")
+    print(f'\nResults are generated from solver={ode_solver}, n_steps={n_steps_generation}\n')
 
     eval_timestamp = torch.tensor([])  # dummy to avoid importing datetime twice
     from datetime import datetime
@@ -724,69 +805,96 @@ def main():
     out_dir = demo_root / "Save_reconstruction_files" / "ForOfflineEvaluation" / f"eval_N{args.Demo_Num}_{eval_timestamp}_from_{train_timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # need_payload = (len(args.extra_metrics) > 0) or args.save_analysis_npz
-    # REPLACED FOR COHERENCE METRIC
+    final_clamp = not args.no_obs_consistency_final_clamp
     need_payload = (
         (len(args.extra_metrics) > 0)
         or args.save_analysis_npz
-        or args.save_coherence_npz
+        or args.save_obs_consistency_plots
+        or args.obs_consistency_compare_modes is not None
     )
-    result = visualize_reconstruction(
-        model=model,
-        dataset=dataset,
-        epoch=int(ckpt.get("epoch", 0)) if isinstance(ckpt, dict) else 0,
-        device=device,
-        save_dir=str(out_dir),
-        cond_fields=vis_cond_fields,
-        n_obs=vis_n_obs_list,
-        n_steps=n_steps_generation,
-        snapshot_index=args.snapshot_index,
-        file_tag=f"snapshot_{args.snapshot_index:04d}",
-        save_metrics_json=True,
-        return_payload=need_payload,
-    )
+    metrics_by_mode = None
 
-    if need_payload:
-        metrics, payload = result
+    if args.obs_consistency_compare_modes is None:
+        result = visualize_reconstruction(
+            model=model,
+            dataset=dataset,
+            epoch=epoch,
+            device=device,
+            save_dir=str(out_dir),
+            cond_fields=vis_cond_fields,
+            n_obs=vis_n_obs_list,
+            n_steps=n_steps_generation,
+            ode_solver=ode_solver,
+            snapshot_index=args.snapshot_index,
+            file_tag=f"snapshot_{args.snapshot_index:04d}_{ode_solver}",
+            save_metrics_json=True,
+            return_payload=need_payload,
+            obs_consistency_mode=args.obs_consistency_mode,
+            obs_consistency_strength=args.obs_consistency_strength,
+            obs_consistency_sigma=args.obs_consistency_sigma,
+            obs_consistency_schedule_power=args.obs_consistency_schedule_power,
+            obs_consistency_final_clamp=final_clamp,
+            save_obs_consistency_plots=args.save_obs_consistency_plots,
+        )
+
+        if need_payload:
+            metrics, payload = result
+        else:
+            metrics = result
+            payload = None
     else:
-        metrics = result
+        metrics_by_mode = {}
+        comparison_rows = []
+        sparse_condition = None
         payload = None
+        metrics = {}
+        for mode in args.obs_consistency_compare_modes:
+            mode_result = visualize_reconstruction(
+                model=model,
+                dataset=dataset,
+                epoch=epoch,
+                device=device,
+                save_dir=str(out_dir),
+                cond_fields=vis_cond_fields,
+                n_obs=vis_n_obs_list,
+                n_steps=n_steps_generation,
+                ode_solver=ode_solver,
+                snapshot_index=args.snapshot_index,
+                file_tag=f"snapshot_{args.snapshot_index:04d}_{ode_solver}_{mode}",
+                save_metrics_json=True,
+                return_payload=True,
+                obs_consistency_mode=mode,
+                obs_consistency_strength=args.obs_consistency_strength,
+                obs_consistency_sigma=args.obs_consistency_sigma,
+                obs_consistency_schedule_power=args.obs_consistency_schedule_power,
+                obs_consistency_final_clamp=final_clamp,
+                save_obs_consistency_plots=False,
+                sparse_condition=sparse_condition,
+            )
+            mode_metrics, mode_payload = mode_result
+            if sparse_condition is None:
+                sparse_condition = {
+                    "obs_coords": mode_payload["obs_coords"],
+                    "obs_values": mode_payload["obs_values"],
+                    "obs_mask": mode_payload["obs_mask"],
+                    "obs_indices": mode_payload["obs_indices"],
+                    "obs_field_ids": mode_payload["obs_field_ids"],
+                }
+            metrics_by_mode[mode] = mode_metrics
+            payload = mode_payload
+            metrics = mode_metrics
+            row = {
+                "mode": mode,
+                "relative_l2": _mean_full_field_relative_l2(mode_metrics),
+                "obs_rel_l2_SenConsis": mode_metrics.get("obs_rel_l2_SenConsis", float("nan")),
+                "obs_count_SenConsis_total": mode_metrics.get("obs_count_SenConsis_total", 0),
+            }
+            comparison_rows.append(row)
+
+        senconsis_dir = out_dir / "SenConsis"
+        save_obs_consistency_comparison(comparison_rows, str(senconsis_dir))
 
     extra_metrics = {}
-
-    # ADDED FOR COHERENCE METRIC
-    if args.save_coherence_npz:
-        if payload is None:
-            print("[Warning: !] Could not save coherence NPZ because payload is None.")
-        else:
-            prefix = f"snapshot_{args.snapshot_index:04d}"
-
-            truth_phys = payload["truth_phys"]   # expected shape: [N, C]
-            recon_phys = payload["recon_phys"]   # expected shape: [N, C]
-            field_names = np.asarray(payload["field_names"])
-
-            # Most current payloads expose 2D plotting coordinates.
-            # This is still valid for graph construction if the point cloud lives in x-y.
-            coords = payload["coords_xy"]        # expected shape: [N, 2]
-
-            coherence_npz_path = out_dir / f"{prefix}_coherence_raw.npz"
-
-            np.savez_compressed(
-                coherence_npz_path,
-                fields_target=truth_phys,
-                fields_pred=recon_phys,
-                coords=coords,
-                field_names=field_names,
-                snapshot_index=np.asarray(args.snapshot_index),
-                split=np.asarray(args.split),
-                n_steps_generation=np.asarray(n_steps_generation),
-                checkpoint=np.asarray(str(ckpt_path)),
-            )
-
-            print(f"[*] Saved coherence raw arrays: {coherence_npz_path}")
-            print(f"    fields_target shape: {truth_phys.shape}")
-            print(f"    fields_pred shape   : {recon_phys.shape}")
-            print(f"    coords shape        : {coords.shape}")   
 
     if payload is not None and len(args.extra_metrics) > 0:
         try:
@@ -876,7 +984,15 @@ def main():
         "vis_cond_fields": [int(v) for v in vis_cond_fields],
         "vis_n_obs_list": [int(v) for v in vis_n_obs_list],
         "n_steps_generation": int(n_steps_generation),
+        "ode_solver": ode_solver,
+        "obs_consistency_mode": args.obs_consistency_mode,
+        "obs_consistency_strength": float(args.obs_consistency_strength),
+        "obs_consistency_sigma": float(args.obs_consistency_sigma),
+        "obs_consistency_schedule_power": float(args.obs_consistency_schedule_power),
+        "obs_consistency_final_clamp": bool(final_clamp),
+        "obs_consistency_compare_modes": args.obs_consistency_compare_modes,
         "metrics": metrics,
+        "metrics_by_mode": metrics_by_mode,
         "extra_metric_names": list(args.extra_metrics),
         "extra_metrics": extra_metrics,
     }

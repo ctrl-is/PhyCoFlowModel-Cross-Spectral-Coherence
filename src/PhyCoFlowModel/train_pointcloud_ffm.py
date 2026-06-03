@@ -12,6 +12,7 @@ With this patch:
 '''
 
 import argparse
+import csv
 import yaml
 import shutil
 import json
@@ -25,19 +26,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from datetime import datetime
 
-from PhyCoFlowModel.helpers import (
-    MetricsLogger,
+from helpers import (
     TurbulentCombustionH5Dataset,
     validate_regular_grid_compatibility,
-    create_recon_dir,
     visualize_reconstruction,
     build_sparse_condition,
 )
-from PhyCoFlowModel.Model import (
+from Model import (
     ConditionalPointFFM, 
     ConditionalPointMLPRBF, 
     ConditionalPointPerceiver,
@@ -87,6 +87,12 @@ def parse_args():
     p.add_argument("--cond-dim", type=int, default=128)
     p.add_argument("--field-embed-dim", type=int, default=64)
     p.add_argument("--rbf-sigma", type=float, default=0.05)
+    p.add_argument("--USE-FOURIER-PE", "--USE_FOURIER_PE", dest="USE_FOURIER_PE", action="store_true",
+                   help="If set, feed Fourier positional coordinate features to point_encoder.")
+    p.add_argument("--fourier-pe-num-bands", type=int, default=32,
+                   help="Number of frequency bands for Fourier positional coordinate encoding.")
+    p.add_argument("--fourier-pe-max-freq", type=float, default=64.0,
+                   help="Maximum frequency scale for Fourier positional coordinate encoding.")
 
     # ------------------------------
     # These are hyperparameters for Perceiver backbone or part of GL_rbf
@@ -117,7 +123,7 @@ def parse_args():
     # Hybrid local-global gather options
     # ----------------------------------------------------------
     p.add_argument(
-        "--gather-mode", type=str, default="rbf", choices=["rbf", "topk_rbf", "topk_rbf_gate", "topk_rbf_ptlocal"],
+        "--gather-mode", type=str, default="rbf", choices=["rbf", "topk_rbf", "topk_rbf_gate", "topk_rbf_ptlocal", "topk_rbf_glres"],
         help="Gather mode used by ConditionalPointHybridLocalGlobalRBF. 'rbf' preserves the current full gather as default.",
     )
     p.add_argument(
@@ -160,11 +166,32 @@ def parse_args():
         help="Hidden channel width of the neuraloperator FNO baseline.",)
     p.add_argument( "--fno-n-layers", type=int, default=4,
         help="Number of Fourier layers in the FNO baseline.",)
+    p.add_argument(
+        "--condition-blur",
+        action="store_true",
+        help="If set, Gaussian-splat sparse FNO conditioning maps before concatenation.",
+    )
+    p.add_argument(
+        "--condition-blur-kernel",
+        type=int,
+        default=5,
+        help="Odd Gaussian kernel size used to splat sparse FNO conditioning maps.",
+    )
+    p.add_argument(
+        "--condition-blur-sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian sigma used to splat sparse FNO conditioning maps.",
+    )
 
     # ------------------------------
     # These are hyperparameters for training process
     # ------------------------------
     p.add_argument("--n-query-points", type=int, default=4096)
+    p.add_argument("--query-sampling", type=str, default="uniform", choices=["uniform", "obs_mix"])
+    p.add_argument("--query-sample-near-ratio", type=float, default=0.25)
+    p.add_argument("--query-sample-far-ratio", type=float, default=0.25)
+    p.add_argument("--query-sample-sigma-ratio", type=float, default=0.05)
     p.add_argument("--prior", type=str, default="rff", choices=["iid", "rff"])
     p.add_argument("--rff-features", type=int, default=256)
     p.add_argument("--rff-lengthscale", type=float, default=0.15)
@@ -261,11 +288,93 @@ def collate_snapshots(batch):
     }
 
 
-def random_query_subset(coords: torch.Tensor, fields: torch.Tensor, n_query: Optional[int]):
+def sample_query_subset(
+    coords: torch.Tensor,
+    fields: torch.Tensor,
+    n_query: Optional[int],
+    mode: str = "uniform",
+    obs_coords: Optional[torch.Tensor] = None,
+    obs_mask: Optional[torch.Tensor] = None,
+    near_ratio: float = 0.25,
+    far_ratio: float = 0.25,
+    sigma_ratio: float = 0.05,
+):
     if n_query is None or n_query >= coords.shape[1]:
         return coords, fields, None
-    idx = torch.randperm(coords.shape[1], device=coords.device)[:n_query].sort().values
-    return coords[:, idx], fields[:, idx], idx
+
+    bsz, n_pts, coord_dim = coords.shape
+    n_query = int(n_query)
+
+    def take_weighted(weights: torch.Tensor, count: int, selected: torch.Tensor) -> torch.Tensor:
+        count = min(int(count), int((~selected).sum().item()))
+        if count <= 0:
+            return torch.empty(0, device=coords.device, dtype=torch.long)
+
+        weights = weights.to(dtype=coords.dtype).clamp_min(0.0)
+        weights = weights.masked_fill(selected, 0.0)
+        pieces = []
+
+        positive = weights > 0
+        if positive.any():
+            n_weighted = min(count, int(positive.sum().item()))
+            sampled = torch.multinomial(weights, num_samples=n_weighted, replacement=False)
+            pieces.append(sampled)
+            selected[sampled] = True
+            count -= n_weighted
+
+        if count > 0:
+            available = (~selected).nonzero(as_tuple=False).squeeze(-1)
+            fill = available[torch.randperm(available.numel(), device=coords.device)[:count]]
+            pieces.append(fill)
+            selected[fill] = True
+
+        return torch.cat(pieces, dim=0) if pieces else torch.empty(0, device=coords.device, dtype=torch.long)
+
+    all_idx = []
+    for b in range(bsz):
+        if mode == "obs_mix" and obs_coords is not None and obs_mask is not None:
+            valid = obs_mask[b].bool()
+        else:
+            valid = None
+
+        if mode != "obs_mix" or valid is None or not valid.any():
+            idx = torch.randperm(n_pts, device=coords.device)[:n_query].sort().values
+            all_idx.append(idx)
+            continue
+
+        d_min = torch.cdist(coords[b:b + 1], obs_coords[b, valid].unsqueeze(0), p=2.0).squeeze(0).amin(dim=-1)
+        bbox_diag = (coords[b].amax(dim=0) - coords[b].amin(dim=0)).norm().clamp_min(1e-6)
+        sigma = (sigma_ratio * bbox_diag).clamp_min(1e-6)
+
+        near_count = min(n_query, max(0, int(round(n_query * near_ratio))))
+        far_count = min(n_query - near_count, max(0, int(round(n_query * far_ratio))))
+        uniform_count = n_query - near_count - far_count
+
+        selected = torch.zeros(n_pts, device=coords.device, dtype=torch.bool)
+        near_weights = torch.exp(-(d_min ** 2) / (2 * sigma ** 2 + 1e-12))
+        far_weights = d_min.clamp_min(0.0)
+
+        pieces = [
+            take_weighted(near_weights, near_count, selected),
+            take_weighted(far_weights, far_count, selected),
+            take_weighted(torch.ones(n_pts, device=coords.device, dtype=coords.dtype), uniform_count, selected),
+        ]
+        if int(selected.sum().item()) < n_query:
+            pieces.append(
+                take_weighted(
+                    torch.ones(n_pts, device=coords.device, dtype=coords.dtype),
+                    n_query - int(selected.sum().item()),
+                    selected,
+                )
+            )
+
+        idx = torch.cat([p for p in pieces if p.numel() > 0], dim=0).sort().values
+        all_idx.append(idx)
+
+    idx = torch.stack(all_idx, dim=0)
+    coord_idx = idx.unsqueeze(-1).expand(-1, -1, coord_dim)
+    field_idx = idx.unsqueeze(-1).expand(-1, -1, fields.shape[-1])
+    return torch.gather(coords, dim=1, index=coord_idx), torch.gather(fields, dim=1, index=field_idx), idx
 
 def run_epoch(
     model: nn.Module,
@@ -276,6 +385,10 @@ def run_epoch(
     n_obs_min_list: Sequence[int],
     n_obs_max_list: Sequence[int],
     n_query_points: Optional[int],
+    query_sampling: str = "uniform",
+    query_sample_near_ratio: float = 0.25,
+    query_sample_far_ratio: float = 0.25,
+    query_sample_sigma_ratio: float = 0.05,
     epoch: int = 0,
 ) -> float:
     training = optimizer is not None
@@ -303,7 +416,18 @@ def run_epoch(
         # for models that must operate on the full regular grid like FNO, 
         # point subsampling will be disabled.
         effective_n_query = None if getattr(model, "requires_full_grid", False) else n_query_points
-        coords_q, fields_q, _ = random_query_subset(coords_full, fields_full, effective_n_query)
+        sampling_mode = query_sampling if training else "uniform"
+        coords_q, fields_q, _ = sample_query_subset(
+            coords=coords_full,
+            fields=fields_full,
+            n_query=effective_n_query,
+            mode=sampling_mode,
+            obs_coords=obs_coords,
+            obs_mask=obs_mask,
+            near_ratio=query_sample_near_ratio,
+            far_ratio=query_sample_far_ratio,
+            sigma_ratio=query_sample_sigma_ratio,
+        )
 
         loss, _ = model.training_loss(
             x1=fields_q,
@@ -375,6 +499,77 @@ def backup_existing_artifact(path: Path) -> None:
     else:
         shutil.copy2(path, target)
 
+
+class TrainingHistoryLogger:
+    def __init__(self, run_dir: Path) -> None:
+        self.csv_path = run_dir / "loss_history.csv"
+        self.json_path = run_dir / "loss_history.json"
+        self.plot_path = run_dir / "loss_history.png"
+        self.rows = []
+        with open(self.csv_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["epoch", "train_loss", "val_loss"])
+
+    def log_and_plot(self, epoch: int, train_loss: float, val_loss: Optional[float] = None) -> None:
+        row = {
+            "epoch": int(epoch),
+            "train_loss": float(train_loss),
+            "val_loss": None if val_loss is None else float(val_loss),
+        }
+        self.rows.append(row)
+
+        with open(self.csv_path, "a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                row["epoch"],
+                row["train_loss"],
+                "" if row["val_loss"] is None else row["val_loss"],
+            ])
+        with open(self.json_path, "w", encoding="utf-8") as handle:
+            json.dump(self.rows, handle, indent=2)
+
+        train_points = [
+            (item["epoch"], item["train_loss"])
+            for item in self.rows
+            if item["train_loss"] is not None and item["train_loss"] > 0.0
+        ]
+        val_points = [
+            (item["epoch"], item["val_loss"])
+            for item in self.rows
+            if item["val_loss"] is not None and item["val_loss"] > 0.0
+        ]
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        if train_points:
+            ax.plot(
+                [item[0] for item in train_points],
+                [item[1] for item in train_points],
+                label="Train Loss",
+                marker="o",
+                color="blue",
+                markersize=4,
+            )
+        if val_points:
+            ax.plot(
+                [item[0] for item in val_points],
+                [item[1] for item in val_points],
+                label="Validation Loss",
+                marker="s",
+                color="orange",
+                markersize=5,
+            )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.set_title("Conditional Point-Cloud FFM Training Progress")
+        if train_points or val_points:
+            ax.set_yscale("log")
+            ax.legend()
+        ax.grid(True, which="both", ls="--", alpha=0.5)
+        fig.tight_layout()
+        fig.savefig(self.plot_path, dpi=150)
+        plt.close(fig)
+
+
 def main():
 
     args = parse_args()
@@ -437,26 +632,26 @@ def main():
 
     # Save the final parsed args to a JSON in the model folder just to be safe
     with open(save_dir / "args.json", "w") as f:
-        import json
         json.dump(vars(args), f, indent=2)
+    if os.path.exists(config_path):
+        shutil.copy(config_path, save_dir / "run_config.yaml")
 
-    # Setup CSV and Recon Dirs
-    csv_base_dir = os.path.join(demo_dir, f"Save_loss_csv")
-    recon_base_dir = os.path.join(demo_dir, f"Save_reconstruction_files")
+    # Keep all run artifacts under the model directory, matching the unified
+    # baseline trainers. The old Save_loss_csv/ and Save_reconstruction_files/
+    # roots are no longer used by this trainer.
+    recon_dir = save_dir / "Evaluation"
 
     if args.RELOAD and reload_ckpt is not None:
-        loss_dir = Path(csv_base_dir) / f"Loss_DemoN{args.Demo_Num}_{run_timestamp}"
-        recon_dir_existing = Path(recon_base_dir) / "ffm_tc_pointcloud" / f"demo_N{args.Demo_Num}_{run_timestamp}"
-
-        backup_existing_artifact(loss_dir)
-        backup_existing_artifact(recon_dir_existing)
+        for loss_artifact in ("loss_history.csv", "loss_history.json", "loss_history.png"):
+            backup_existing_artifact(save_dir / loss_artifact)
+        backup_existing_artifact(recon_dir)
 
     # Initialize helpers
-    logger = MetricsLogger(base_dir=csv_base_dir, Demo_Num=args.Demo_Num, timestamp=run_timestamp)
-    recon_dir = create_recon_dir(base_dir=recon_base_dir, Demo_Num=args.Demo_Num, timestamp=run_timestamp)
+    logger = TrainingHistoryLogger(save_dir)
+    recon_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"[*] Model checkpoints will save to: {save_dir}")
-    print(f"[*] Logging losses to: {logger.save_dir}")
+    print(f"[*] Logging losses to: {save_dir}")
     print(f"[*] Saving recon plots to: {recon_dir}\n")
 
     device_ids = args.device_ids
@@ -508,6 +703,9 @@ def main():
             cond_dim=args.cond_dim,
             field_embed_dim=args.field_embed_dim,
             rbf_sigma=args.rbf_sigma,
+            use_fourier_pe=args.USE_FOURIER_PE,
+            fourier_pe_num_bands=args.fourier_pe_num_bands,
+            fourier_pe_max_freq=args.fourier_pe_max_freq,
         )
         model = PointCloudFFM(backbone, prior, sigma_min=args.sigma_min).to(device)
     elif args.backbone == "perceiver":
@@ -551,18 +749,52 @@ def main():
 
             sensor_local_topk=args.sensor_local_topk,
             sensor_local_dropout=args.sensor_local_dropout,
+            use_fourier_pe=args.USE_FOURIER_PE,
+            fourier_pe_num_bands=args.fourier_pe_num_bands,
+            fourier_pe_max_freq=args.fourier_pe_max_freq,
         )
         model = PointCloudFFM(backbone, prior, sigma_min=args.sigma_min).to(device)
     elif args.backbone == "fno":
         # FNO requires an explicit regular-grid interpretation of the dataset.
         try:
-            validate_regular_grid_compatibility(train_set, args.Num_x, args.Num_y)
+            grid_info = validate_regular_grid_compatibility(train_set, args.Num_x, args.Num_y)
             validate_regular_grid_compatibility(val_set, args.Num_x, args.Num_y)
         except ValueError as e:
             print(f"\n[Warning: !] {e}")
             print("[Warning: !] FNO baseline cannot start because the provided Num_x / Num_y "
                   "are missing or incompatible with the dataset.\n")
             raise SystemExit(1)
+
+        print(
+            "[*] FNO grid detected: "
+            f"{grid_info['unique_x']} unique x values x {grid_info['unique_y']} unique y values "
+            f"= {grid_info['num_points']} points."
+        )
+        print(
+            "[*] FNO grid spacing in normalized coords: "
+            f"x min/med/max={grid_info['x_spacing_min']:.3e}/"
+            f"{grid_info['x_spacing_median']:.3e}/{grid_info['x_spacing_max']:.3e}, "
+            f"y min/med/max={grid_info['y_spacing_min']:.3e}/"
+            f"{grid_info['y_spacing_median']:.3e}/{grid_info['y_spacing_max']:.3e}."
+        )
+        if grid_info["requires_permutation"]:
+            print(
+                "[*] FNO grid order: dataset is not row-major; the FNO backbone will "
+                "internally permute point order -> row-major grid and invert the "
+                "permutation on output."
+            )
+            print(
+                "[*] FNO grid permutation sample: first row-major cells come from "
+                f"original indices {grid_info['first_row_original_indices']}; "
+                "first original points map to grid cells "
+                f"{grid_info['first_original_to_grid_indices']}."
+            )
+        if not grid_info["spacing_regular"]:
+            print(
+                "[*] FNO grid note: physical x/y spacing is nonuniform. FNO will run "
+                "on the topological index grid; point-cloud baselines still use "
+                "the physical coordinates directly."
+            )
 
         backbone = FNO(
             n_fields=train_set.num_fields,
@@ -572,6 +804,9 @@ def main():
             n_modes_y=args.fno_modes_y,
             hidden_channels=args.fno_hidden_channels,
             n_layers=args.fno_n_layers,
+            condition_blur=args.condition_blur,
+            condition_blur_kernel=args.condition_blur_kernel,
+            condition_blur_sigma=args.condition_blur_sigma,
         )
         model = FNOFFM(backbone, prior, sigma_min=args.sigma_min).to(device)
 
@@ -603,6 +838,10 @@ def main():
             n_obs_min_list=args.n_obs_min_list,
             n_obs_max_list=args.n_obs_max_list,
             n_query_points=args.n_query_points,
+            query_sampling=args.query_sampling,
+            query_sample_near_ratio=args.query_sample_near_ratio,
+            query_sample_far_ratio=args.query_sample_far_ratio,
+            query_sample_sigma_ratio=args.query_sample_sigma_ratio,
             epoch=epoch,
         )
         scheduler.step()
@@ -620,6 +859,10 @@ def main():
                     n_obs_min_list=args.n_obs_min_list,
                     n_obs_max_list=args.n_obs_max_list,
                     n_query_points=args.n_query_points,
+                    query_sampling=args.query_sampling,
+                    query_sample_near_ratio=args.query_sample_near_ratio,
+                    query_sample_far_ratio=args.query_sample_far_ratio,
+                    query_sample_sigma_ratio=args.query_sample_sigma_ratio,
                     epoch=epoch,
                 )
             print(f"[valid] epoch={epoch:04d} loss={val_loss:.6e}")
@@ -649,8 +892,8 @@ def main():
         if epoch % args.save_every == 0:
             # Benchmark the same validation snapshot at several NFEs.
 
-            recon_dir_epoch = os.path.join(recon_dir, f"Epoch_{epoch}")
-            os.makedirs(recon_dir_epoch, exist_ok=True)
+            recon_dir_epoch = recon_dir / f"epoch_{epoch:04d}"
+            recon_dir_epoch.mkdir(parents=True, exist_ok=True)
             
             step_list = args.benchmark_n_steps if args.benchmark_n_steps else [args.n_steps_generation]
             for nfe in step_list:
@@ -675,11 +918,12 @@ def main():
                     dataset=val_set,
                     epoch=epoch,
                     device=device,
-                    save_dir=recon_dir_epoch,
+                    save_dir=str(recon_dir_epoch),
 
                     cond_fields=args.vis_cond_fields,
                     n_obs=args.vis_n_obs_list,
                     n_steps=nfe,
+                    ode_solver=args.ode_solver,
                     snapshot_index=0,
                     file_tag=f"{args.ode_solver}_nfe{nfe}",
                     save_metrics_json = True,
