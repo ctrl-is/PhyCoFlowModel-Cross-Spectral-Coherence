@@ -2087,6 +2087,10 @@ class FNOFFM(PointCloudFFM):
         obs_mask: torch.Tensor,
         obs_field_ids: torch.Tensor,
         obs_indices: Optional[torch.Tensor] = None,
+        spectral_U=None,
+        spectral_bands=None,
+        lambda_coh: float = 0.0,
+        spectral_cfg=None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         RF training loss for the grid-based FNO backbone.
@@ -2116,8 +2120,38 @@ class FNOFFM(PointCloudFFM):
             obs_indices=obs_indices,
         )
 
-        loss = F.mse_loss(pred, target)
-        return loss, {"loss": float(loss.detach().cpu())}
+        rf_loss = F.mse_loss(pred, target)
+        loss = rf_loss
+
+        metrics = {
+            "loss": float(loss.detach().cpu()),
+            "rf_loss": float(rf_loss.detach().cpu()),
+        }
+
+        if spectral_U is not None and float(lambda_coh) > 0.0:
+            tau = (1.0 - t).view(-1, 1, 1)
+            x1_hat = x_t + tau * pred
+
+            spectral = compute_cross_spectral_coherence_loss(
+                fields_pred=x1_hat,
+                fields_target=x1,
+                U=spectral_U,
+                bands=spectral_bands,
+                cfg=spectral_cfg,
+            )
+
+            loss = rf_loss + float(lambda_coh) * coh_loss
+            coh_loss = spectral["loss"]
+            metrics["loss"] = float(loss.detach().cpu())
+            metrics["coh_loss"] = float(coh_loss.detach().cpu())
+
+            for name, value in spectral.get("band_losses", {}).items():
+                metrics[f"coh_{name}_loss"] = float(value.detach().cpu())
+
+            for name, value in spectral.get("band_ratios", {}).items():
+                metrics[f"coh_{name}_ratio"] = float(value.detach().cpu())
+
+        return loss, metrics
 
     @torch.no_grad()
     def sample(
