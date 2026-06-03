@@ -410,12 +410,13 @@ def run_epoch(
     spectral_bands=None,
     lambda_coh=0.0,
     spectral_cfg=None,
-) -> float:
+) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
 
     total = 0.0
     count = 0
+    metric_totals: Dict[str, float] = {}
 
     mode_str = "Train" if training else "Eval"
     pbar = tqdm(loader, desc=f"Epoch {epoch:04d} [{mode_str}]", leave=False)
@@ -457,7 +458,7 @@ def run_epoch(
                 query_idx = query_idx.to(device=spectral_U.device, dtype=torch.long)
                 spectral_U_q = spectral_U[query_idx]
 
-        loss, _ = model.training_loss(
+        loss, metrics = model.training_loss(
             x1=fields_q,
             coords=coords_q,
             obs_coords=obs_coords,
@@ -480,9 +481,47 @@ def run_epoch(
         current_loss = float(loss.detach().cpu())
         total += current_loss
         count += 1
-        pbar.set_postfix_str(f"loss={current_loss:.6e}")
 
-    return total / max(count, 1)
+        # Now we are able to keep track of the cross-spectral coherence and the
+        # associated metrics
+        metrics = dict(metrics)
+        metrics["loss"] = current_loss
+
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                value = float(value.detach().cpu())
+            else:
+                value = float(value)
+
+            metric_totals[key] = metric_totals.get(key, 0.0) + value
+
+        postfix = f"loss={current_loss:.6e}"
+
+        if "rf_loss" in metrics:
+            postfix += f", rf={float(metrics['rf_loss']):.3e}"
+
+        if "coh_loss" in metrics:
+            postfix += f", coh={float(metrics['coh_loss']):.3e}"
+
+        if "coh_low_loss" in metrics:
+            postfix += f", low={float(metrics['coh_low_loss']):.3e}"
+
+        if "coh_mid_loss" in metrics:
+            postfix += f", mid={float(metrics['coh_mid_loss']):.3e}"
+
+        if "coh_high_loss" in metrics:
+            postfix += f", high={float(metrics['coh_high_loss']):.3e}"
+
+        pbar.set_postfix_str(postfix)
+
+        avg_metrics = {
+            key: value / max(count, 1)
+            for key, value in metric_totals.items()
+        }
+
+        avg_metrics["loss"] = total / max(count, 1)
+
+    return avg_metrics
 
 
 def find_latest_run_dir(demo_dir: str, save_dir: str, demo_num: int) -> Optional[Path]:
@@ -891,7 +930,7 @@ def main():
         print("[*] Reloaded model state from best.pt")
 
     for epoch in range(start_epoch, args.epochs + 1):
-        tr_loss = run_epoch(
+        tr_metrics = run_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -910,13 +949,14 @@ def main():
             lambda_coh=args.lambda_coh,
             spectral_cfg=spectral_cfg,
         )
+        tr_loss = tr_metrics["loss"]
         scheduler.step()
 
         print(f"[train] epoch={epoch:04d} loss={tr_loss:.6e}")
         val_loss = None
         if epoch % args.eval_every == 0 or epoch == 1:
             with torch.no_grad():
-                val_loss = run_epoch(
+                val_metrics = run_epoch(
                     model=model,
                     loader=val_loader,
                     optimizer=None,
@@ -935,6 +975,7 @@ def main():
                     lambda_coh=args.lambda_coh,
                     spectral_cfg=spectral_cfg,
                 )
+                val_loss = val_metrics["loss"]
             print(f"[valid] epoch={epoch:04d} loss={val_loss:.6e}")
 
             ckpt = {
@@ -952,6 +993,12 @@ def main():
                 "ode_solver": args.ode_solver,
                 "Num_x": args.Num_x,
                 "Num_y": args.Num_y,
+                "train_metrics": tr_metrics,
+                "val_metrics": val_metrics,
+                "lambda_coh": args.lambda_coh,
+                "graph_basis_path": args.graph_basis_path,
+                "coherence_eps": args.coherence_eps,
+                "coherence_eps_ratio": args.coherence_eps_ratio,
             }
             torch.save(ckpt, save_dir / "last.pt")
             if val_loss < best_val:
