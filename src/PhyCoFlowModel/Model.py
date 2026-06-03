@@ -2139,9 +2139,9 @@ class FNOFFM(PointCloudFFM):
                 bands=spectral_bands,
                 cfg=spectral_cfg,
             )
-
-            loss = rf_loss + float(lambda_coh) * coh_loss
+            
             coh_loss = spectral["loss"]
+            loss = rf_loss + float(lambda_coh) * coh_loss
             metrics["loss"] = float(loss.detach().cpu())
             metrics["coh_loss"] = float(coh_loss.detach().cpu())
 
