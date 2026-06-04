@@ -514,12 +514,12 @@ def run_epoch(
 
         pbar.set_postfix_str(postfix)
 
-        avg_metrics = {
-            key: value / max(count, 1)
-            for key, value in metric_totals.items()
-        }
+    avg_metrics = {
+        key: value / max(count, 1)
+        for key, value in metric_totals.items()
+    }
 
-        avg_metrics["loss"] = total / max(count, 1)
+    avg_metrics["loss"] = total / max(count, 1)
 
     return avg_metrics
 
@@ -1030,7 +1030,24 @@ def main():
                 #     file_tag=f"{args.ode_solver}_nfe{nfe}",
                 # )
 
-                recon_metrics = visualize_reconstruction(
+                # recon_metrics = visualize_reconstruction(
+                #     model=model,
+                #     dataset=val_set,
+                #     epoch=epoch,
+                #     device=device,
+                #     save_dir=str(recon_dir_epoch),
+
+                #     cond_fields=args.vis_cond_fields,
+                #     n_obs=args.vis_n_obs_list,
+                #     n_steps=nfe,
+                #     ode_solver=args.ode_solver,
+                #     snapshot_index=0,
+                #     file_tag=f"{args.ode_solver}_nfe{nfe}",
+                #     save_metrics_json = True,
+                # )
+
+                # Saves an .npz file for visualization
+                recon_result = visualize_reconstruction(
                     model=model,
                     dataset=val_set,
                     epoch=epoch,
@@ -1043,7 +1060,19 @@ def main():
                     ode_solver=args.ode_solver,
                     snapshot_index=0,
                     file_tag=f"{args.ode_solver}_nfe{nfe}",
-                    save_metrics_json = True,
+                    save_metrics_json=True,
+                    return_payload=True,
+                )
+                recon_metrics, recon_payload = recon_result
+                np.savez_compressed(
+                    recon_dir_epoch / f"{args.ode_solver}_nfe{nfe}_coherence_raw.npz",
+                    fields_pred=recon_payload["recon"][0].detach().cpu().numpy(),
+                    fields_target=recon_payload["truth"][0].detach().cpu().numpy(),
+                    coords=recon_payload["coords"][0].detach().cpu().numpy(),
+                    field_names=np.array(recon_payload["field_names"]),
+                    snapshot_index=int(recon_payload["snapshot_index"]),
+                    n_steps_generation=int(nfe),
+                    checkpoint=str(save_dir / "best.pt"),
                 )
 
                 metric_str = ", ".join([f"{k}:{v:.4e}" for k, v in recon_metrics.items()])
