@@ -1,9 +1,10 @@
+from typing import Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import numpy as np
 from dataclasses import dataclass
 
-def gft(fields, U):
+def gft(fields: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
     """
     Project fields into graph-frequency space.
 
@@ -34,7 +35,7 @@ def gft(fields, U):
     
     raise ValueError(f"U must have shape [N, K] or [B, N, K], got {tuple(U.shape)}.")
 
-def inverse_graph_fourier_transform(gft_coeffs, U):
+def inverse_graph_fourier_transform(gft_coeffs: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
     """
     Reconstructs spatial fields from graph Fourier coefficients.
 
@@ -54,7 +55,7 @@ def inverse_graph_fourier_transform(gft_coeffs, U):
     """
     return torch.einsum("nk,bkc->bnc", U, gft_coeffs)
 
-def estimate_auto_spectra(gft_coeffs):
+def estimate_auto_spectra(gft_coeffs: torch.Tensor) -> torch.Tensor:
     """
     Graph power spectral density: the energy distribution per field per frequency.
 
@@ -66,13 +67,13 @@ def estimate_auto_spectra(gft_coeffs):
     Returns:
         [K, C] — auto_spectra[k, c] = average energy of field c at frequency k
     """
-    return (gft_coeffs ** 2).mean(dim=0)
+    return (torch.abs(gft_coeffs) ** 2).mean(dim=0)
 
-def estimate_cross_spectra(gft_coeffs):
+def estimate_cross_spectra(gft_coeffs: torch.Tensor) -> torch.Tensor:
     """
     Graph cross-spectral density: the shared structure between field pairs.
 
-    hat{p}_{c1,c2}[k] = (1/B) sum_b hat{X}_{b,k,c1} * hat{X}_{b,k,c2}
+    hat{p}_{c1,c2}[k] = (1/B) sum_b hat{X}_{b,k,c1} * conj(hat{X}_{b,k,c2})
 
     Args:
         gft_coeffs: [B, K, C] - torch.Tensor
@@ -83,9 +84,9 @@ def estimate_cross_spectra(gft_coeffs):
                     Diagonal entries equal the auto-spectra.
     """
     B = gft_coeffs.shape[0]
-    return torch.einsum("bki,bkj->kij", gft_coeffs, gft_coeffs) / B
+    return torch.einsum("bki,bkj->kij", gft_coeffs, torch.conj(gft_coeffs)) / B
 
-def compute_coherence(auto_spectra, cross_spectra, eps: float = 1e-8,):
+def compute_coherence(auto_spectra: torch.Tensor, cross_spectra: torch.Tensor, eps: float = 1e-8,) -> torch.Tensor:
     """
     Graph coherence: normalized spectral coupling strength.
 
@@ -104,14 +105,14 @@ def compute_coherence(auto_spectra, cross_spectra, eps: float = 1e-8,):
         [K, C, C] — coherence values in [0, 1]
     """
     denom = torch.einsum("ki,kj->kij", auto_spectra, auto_spectra)
-    numer = cross_spectra ** 2
+    numer = torch.abs(cross_spectra) ** 2
     return numer / (denom + eps)
 
 @dataclass
 class CrossSpectralConfig:
     """All hyperparameters for the cross-spectral coherence system."""
 
-   # Graph construction (passed to graph.py functions)
+    # Graph construction (passed to graph.py functions)
     k_neighbors: int = 16
     sigma: float = None    # None = median heuristic
     num_modes: int = 256
@@ -120,18 +121,22 @@ class CrossSpectralConfig:
     eps: float = 1e-8
     eps_ratio: float = 1e-12
 
-    # Loss weights (Section 4.7: L_spectral = λ_coh * L_coh + λ_cross * L_cross + λ_auto * L_auto)
+    # Loss weights
+    # lambda_coh/lambda_cross/lambda_auto are legacy auxiliary-loss weights
+    # eta_crossfreq is for the updated physical coherence objective
     lambda_coh: float = 1.0
     lambda_cross: float = 1.0
     lambda_auto: float = 1.0
+    eta_crossfreq: float = 1.0
 
     # Optional: restrict to specific field pairs (None = all pairs i < j), List of tuples
     field_pairs: any = None
 
-
-# Loss Functions (Sections 4.6-4.7)
-
-def coherence_matching_loss(coherence_pred, coherence_target, field_pairs=None):
+def same_freq_coherence_loss(
+        coherence_pred: torch.Tensor, 
+        coherence_target: torch.Tensor, 
+        field_pairs: list[Tuple[int, int]] | None = None
+        ) -> torch.Tensor:
     """
     L_coh = (1/|pairs|) sum_{c1<c2} || c^pred_{c1,c2} - c^data_{c1,c2} ||^2
 
@@ -149,12 +154,16 @@ def coherence_matching_loss(coherence_pred, coherence_target, field_pairs=None):
     loss = torch.tensor(0.0, device=coherence_pred.device, dtype=coherence_pred.dtype)
     for i, j in field_pairs:
         diff = coherence_pred[:, i, j] - coherence_target[:, i, j]
-        loss = loss + (diff ** 2).mean()
+        loss = loss + (torch.abs(diff) ** 2).mean()
 
     return loss / len(field_pairs)
 
 
-def cross_spectrum_matching_loss(cross_spectra_pred, cross_spectra_target, field_pairs=None):
+def same_freq_cross_spectrum_loss(
+        cross_spectra_pred: torch.Tensor, 
+        cross_spectra_target: torch.Tensor , 
+        field_pairs: list[Tuple[int, int]] | None = None
+        ) -> torch.Tensor:
     """
     L_cross = (1/|pairs|) sum_{c1<c2} || p^pred_{c1,c2} - p^data_{c1,c2} ||^2
 
@@ -172,12 +181,12 @@ def cross_spectrum_matching_loss(cross_spectra_pred, cross_spectra_target, field
     loss = torch.tensor(0.0, device=cross_spectra_pred.device, dtype=cross_spectra_pred.dtype)
     for i, j in field_pairs:
         diff = cross_spectra_pred[:, i, j] - cross_spectra_target[:, i, j]
-        loss = loss + (diff ** 2).mean()
+        loss = loss + (torch.abs(diff) ** 2).mean()
 
     return loss / len(field_pairs)
 
 
-def auto_spectrum_matching_loss(auto_spectra_pred, auto_spectra_target):
+def same_freq_auto_spectrum_loss(auto_spectra_pred: torch.Tensor, auto_spectra_target: torch.Tensor) -> torch.Tensor:
     """
     L_auto = (1/C) sum_c || p^pred_c - p^data_c ||^2
 
@@ -187,14 +196,14 @@ def auto_spectrum_matching_loss(auto_spectra_pred, auto_spectra_target):
     return ((auto_spectra_pred - auto_spectra_target) ** 2).mean()
 
 
-def combined_spectral_loss(
-    fields_pred: torch.Tensor,
-    fields_target: torch.Tensor,
-    U: torch.Tensor,
-    cfg=None):
+def legacy_combined_spectral_loss(
+        fields_pred: torch.Tensor,
+        fields_target: torch.Tensor,
+        U: torch.Tensor,
+        cfg: CrossSpectralConfig | None = None
+        ) -> Dict[str, torch.Tensor]:
     """
-    Full spectral regularizer (Section 4.7):
-        L_spectral = λ_coh * L_coh + λ_cross * L_cross + λ_auto * L_auto
+    L_spectral = λ_coh * L_coh + λ_cross * L_cross + λ_auto * L_auto
 
     REQUIREMENT: fields_pred and fields_target must be [B, N, C] where
     N matches U.shape[0]. These must be FULL spatial fields, not
@@ -227,9 +236,9 @@ def combined_spectral_loss(
     coh_target = compute_coherence(auto_target, cross_target, eps=cfg.eps)
 
     # Losses
-    L_coh = coherence_matching_loss(coh_pred, coh_target, cfg.field_pairs)
-    L_cross = cross_spectrum_matching_loss(cross_pred, cross_target, cfg.field_pairs)
-    L_auto = auto_spectrum_matching_loss(auto_pred, auto_target)
+    L_coh = same_freq_coherence_loss(coh_pred, coh_target, cfg.field_pairs)
+    L_cross = same_freq_cross_spectrum_loss(cross_pred, cross_target, cfg.field_pairs)
+    L_auto = same_freq_auto_spectrum_loss(auto_pred, auto_target)
 
     L_total = (
         cfg.lambda_coh * L_coh
@@ -250,11 +259,13 @@ def combined_spectral_loss(
         "coherence_target": coh_target.detach(),
     }
 
-def compute_cross_spectral_coherence_loss(fields_pred,
-    fields_target,
-    U,
-    bands=None,
-    cfg=None):
+def compute_same_freq_coherence_diagnostics(
+        fields_pred: torch.Tensor,
+        fields_target: torch.Tensor,
+        U: torch.Tensor,
+        bands: dict[str, list[int]] | np.ndarray | torch.Tensor | None = None,
+        cfg: CrossSpectralConfig | None = None
+        ) -> dict[str, object]:
     """
     Compute graph coherence loss and optional band decomposition.
 
@@ -282,11 +293,10 @@ def compute_cross_spectral_coherence_loss(fields_pred,
     coh_pred = compute_coherence(auto_pred, cross_pred, eps=cfg.eps)
     coh_target = compute_coherence(auto_target, cross_target, eps=cfg.eps)
 
-    L_coh = coherence_matching_loss(coh_pred, coh_target, cfg.field_pairs)
+    L_coh = same_freq_coherence_loss(coh_pred, coh_target, cfg.field_pairs)
 
-    # Optional diagnostics from original paper, not the main updated training loss yet
-    L_cross = cross_spectrum_matching_loss(cross_pred, cross_target, cfg.field_pairs)
-    L_auto = auto_spectrum_matching_loss(auto_pred, auto_target)
+    L_cross = same_freq_cross_spectrum_loss(cross_pred, cross_target, cfg.field_pairs)
+    L_auto = same_freq_auto_spectrum_loss(auto_pred, auto_target)
 
     # Optional low/mid/high decomposition of the same coherence loss.
     band_losses = {}
@@ -303,11 +313,11 @@ def compute_cross_spectral_coherence_loss(fields_pred,
             coh_pred_band = coh_pred[band_idx, :, :]
             coh_target_band = coh_target[band_idx, :, :]
 
-            L_band = coherence_matching_loss(
-                coh_pred_band,
-                coh_target_band,
-                cfg.field_pairs,
-            )
+            L_band = same_freq_coherence_loss(
+                    coh_pred_band,
+                    coh_target_band,
+                    cfg.field_pairs,
+                    )
 
             band_losses[band_name] = L_band
             band_ratios[band_name] = L_band / (L_coh + cfg.eps_ratio)
@@ -323,5 +333,249 @@ def compute_cross_spectral_coherence_loss(fields_pred,
         "coh_target": coh_target,
     }
 
+def compute_band_energy(
+        gft_coeffs: torch.Tensor, 
+        band_idx: list[int] | np.ndarray | torch.Tensor
+        ) -> torch.Tensor:
+    """
+    Computes the band energy for one graph-frequency band.
 
+    Args:
+        gft_coeffs: [B, K, C]
+        band_idx: indices of graph frequencies in the band
+
+    Returns:
+        band_energy: [B, C]
+    """
+    band_idx = torch.as_tensor(band_idx, device=gft_coeffs.device, dtype=torch.long)
+    selected_coeffs = gft_coeffs[:, band_idx, :]
+    # take the magnitude in case of complex values
+    energy = torch.sum(torch.abs(selected_coeffs) ** 2, dim=1)
+    
+    return energy
+
+def compute_centered_band_energy(band_energy: torch.Tensor) -> torch.Tensor:
+    """
+    Centers band energy across the batch dimension.
+
+    Args:
+        band_energy: [B, C]
+
+    Returns:
+        centered_band_energy: [B, C]
+    """
+    mean_energy = band_energy.mean(dim=0)
+    centered_energy = band_energy - mean_energy
+    
+    return centered_energy
+
+def compute_all_centered_band_energies(
+        gft_coeffs: torch.Tensor,
+        bands: Dict[str, list[int] | np.ndarray | torch.Tensor]
+        ) -> Tuple[Dict[str, torch.Tensor], list[str]]:
+    """
+    Computes centered band energies for all frequency bands.
+
+    Args:
+        gft_coeffs: [B, K, C]
+        bands: dict mapping band name -> frequency indices
+
+    Returns:
+        centered_band_energies: mapping band name -> centered band energy [B, C]
+        band_names = list of band names in consistent order
+    """
+    centered_band_energies = {}
+    band_names = list(bands.keys())
+
+    for band_name in band_names:
+        band_idx = bands[band_name]
+
+        band_energy = compute_band_energy(gft_coeffs, band_idx)
+        centered_energy = compute_centered_band_energy(band_energy)
+
+        centered_band_energies[band_name] = centered_energy
+
+    return centered_band_energies, band_names
+
+def compute_all_cross_band_covariances(
+        gft_coeffs: torch.Tensor,
+        bands: dict[str, list[int] | np.ndarray | torch.Tensor],
+        ) -> tuple[torch.Tensor, list[str]]:
+    """
+    Computes all cross-band covariance matrices.
+
+    Args:
+        gft_coeffs: [B, K, C]
+        bands: dict mapping band name -> frequency indices
+
+    Returns:
+        S: [M, M, C, C]
+        band_names: list[str]
+    """
+    centered_band_energies, band_names = compute_all_centered_band_energies(
+        gft_coeffs,
+        bands,
+    )
+
+    M = len(band_names)
+    _, C = next(iter(centered_band_energies.values())).shape
+
+    S = torch.empty(
+        (M, M, C, C),
+        device=gft_coeffs.device,
+        dtype=gft_coeffs.dtype,
+    )
+
+    for i, band_i in enumerate(band_names):
+        for j, band_j in enumerate(band_names):
+            centered_i = centered_band_energies[band_i]  # [B, C]
+            centered_j = centered_band_energies[band_j]  # [B, C]
+
+            B = centered_i.shape[0]
+            S[i, j] = torch.einsum("bc,bd->cd", centered_i, centered_j) / B
+
+    return S, band_names
+
+def compute_normalized_cross_band_coupling(S: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Computes the normalized cross-band coupling scores.
+
+    Args:
+        S: [M, M, C, C]
+
+    Returns:
+        Q: [M, M, C, C]
+    """
+    M, _, C, _ = S.shape
+    self_cov = torch.empty((M, C), device=S.device, dtype=S.dtype)
+
+    for i in range(M):
+        self_cov[i] = torch.diagonal(S[i, i], dim1=0, dim2=1)
+
+    denom = torch.einsum("ic,jd->ijcd", self_cov, self_cov) + eps
+
+    Q = (torch.abs(S) ** 2) / denom
+    return Q
+
+def cross_frequency_coupling_loss(
+        Q_pred: torch.Tensor,
+        Q_target: torch.Tensor,
+        field_pairs: list[Tuple[int, int]] | None = None
+        ) -> torch.Tensor:
+    """
+    Computes L_crossfreq by comparing predicted and target normalized
+    cross-band coupling scores on off-diagonal band pairs.
+
+    Args:
+        Q_pred: [M, M, C, C]
+        Q_target: [M, M, C, C]
+        field_pairs: optional list of field index pairs
+
+    Returns:
+        scalar loss
+    """
+    M, _, C, _ = Q_pred.shape
+
+    if field_pairs is None:
+        field_pairs = [(i, j) for i in range(C) for j in range(i + 1, C)]
+
+    if len(field_pairs) == 0:
+        return torch.tensor(0.0, device=Q_pred.device, dtype=Q_pred.dtype)
+
+    off_diag_mask = ~torch.eye(M, dtype=torch.bool, device=Q_pred.device)
+
+    loss = torch.tensor(0.0, device=Q_pred.device, dtype=Q_pred.dtype)
+
+    for c1, c2 in field_pairs:
+        diff = Q_pred[:, :, c1, c2] - Q_target[:, :, c1, c2]
+        off_diag_diff = diff[off_diag_mask]
+        loss = loss + (torch.abs(off_diag_diff) ** 2).mean()
+    
+    return loss / len(field_pairs)
+
+def compute_physical_coherence_loss(
+        fields_pred: torch.Tensor,
+        fields_target: torch.Tensor,
+        U: torch.Tensor,
+        bands: Dict[str, list[int] | np.ndarray | torch.Tensor],
+        cfg: CrossSpectralConfig | None = None,
+        ) -> Dict[str, object]:
+    """
+    Computes the final physical coherence loss:
+
+        L_phys_coh = L_same + eta_crossfreq * L_crossfreq
+
+    where:
+        L_same compares same-frequency graph coherence.
+        L_crossfreq compares off-diagonal cross-band coupling scores.
+
+    Args:
+        fields_pred: [B, N, C] predicted full fields
+        fields_target: [B, N, C] target full fields
+        U: [N, K] graph Fourier basis
+        bands: dict mapping band name -> frequency-mode indices
+        cfg: optional CrossSpectralConfig
+
+    Returns:
+        Dict containing total loss, component losses, and diagnostics.
+    """
+    cfg = cfg or CrossSpectralConfig()
+
+    # Graph Fourier transforms: [B, N, C] -> [B, K, C]
+    gft_pred = gft(fields_pred, U)
+    gft_target = gft(fields_target, U)
+
+    # ----- Same-frequency coherence loss: L_same -----
+    auto_pred = estimate_auto_spectra(gft_pred)
+    auto_target = estimate_auto_spectra(gft_target)
+
+    cross_pred = estimate_cross_spectra(gft_pred)
+    cross_target = estimate_cross_spectra(gft_target)
+
+    coh_pred = compute_coherence(auto_pred, cross_pred, eps=cfg.eps)
+    coh_target = compute_coherence(auto_target, cross_target, eps=cfg.eps)
+
+    L_same = same_freq_coherence_loss(
+        coh_pred,
+        coh_target,
+        cfg.field_pairs,
+    )
+
+    # ----- Cross-frequency coupling loss: L_crossfreq -----
+    S_pred, band_names = compute_all_cross_band_covariances(gft_pred, bands)
+    S_target, _ = compute_all_cross_band_covariances(gft_target, bands)
+
+    Q_pred = compute_normalized_cross_band_coupling(S_pred, eps=cfg.eps)
+    Q_target = compute_normalized_cross_band_coupling(S_target, eps=cfg.eps)
+
+    L_crossfreq = cross_frequency_coupling_loss(
+        Q_pred,
+        Q_target,
+        cfg.field_pairs,
+    )
+
+    # ----- Final physical coherence objective -----
+    L_phys_coh = L_same + cfg.eta_crossfreq * L_crossfreq
+
+    return {
+        "loss": L_phys_coh,
+        "L_phys_coh": L_phys_coh,
+        "L_same": L_same,
+        "L_crossfreq": L_crossfreq,
+
+        # Same-frequency diagnostics
+        "coh_pred": coh_pred.detach(),
+        "coh_target": coh_target.detach(),
+        "auto_spectra_pred": auto_pred.detach(),
+        "auto_spectra_target": auto_target.detach(),
+        "cross_spectra_pred": cross_pred.detach(),
+        "cross_spectra_target": cross_target.detach(),
+
+        # Cross-frequency diagnostics
+        "S_pred": S_pred.detach(),
+        "S_target": S_target.detach(),
+        "Q_pred": Q_pred.detach(),
+        "Q_target": Q_target.detach(),
+        "band_names": band_names,
+    }
 
