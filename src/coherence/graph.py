@@ -1,9 +1,10 @@
+from typing import Optional, Tuple, Dict
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
 
-def get_nodes(dataset, use_raw = False):
+def get_nodes(dataset, use_raw: bool = False) -> np.ndarray:
     """
     Returns graph node coordinates from TurbulentCombustionH5Dataset.
 
@@ -13,7 +14,7 @@ def get_nodes(dataset, use_raw = False):
     coords = dataset.coords_raw if use_raw else dataset.coords
     return coords.cpu().numpy()
 
-def build_knn_edges(coords, k = 16):
+def build_knn_edges(coords: np.ndarray, k: int = 16) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build k Nearest Neighbors edge list from coordinates.
 
@@ -21,7 +22,7 @@ def build_knn_edges(coords, k = 16):
         edge_index: array of shape [E, 2]
         distances: array of shape [E]
     """
-    coords = np.asarray(coords, dtype = np.float64)
+    coords = np.asarray(coords, dtype=np.float64)
     n = coords.shape[0]
 
     if n < 2:
@@ -30,7 +31,7 @@ def build_knn_edges(coords, k = 16):
     k = min(k, n - 1)
     tree = cKDTree(coords)
 
-    distances, indices = tree.query(coords, k = k + 1)
+    distances, indices = tree.query(coords, k=k + 1)
     distances = distances[:, 1:]
     indices = indices[:, 1:]
 
@@ -42,7 +43,11 @@ def build_knn_edges(coords, k = 16):
 
     return edge_index, dists
 
-def build_weighted_matrix(coords, k = 16, sigma = None):
+def build_weighted_matrix(
+                        coords: np.ndarray, 
+                        k: int = 16, 
+                        sigma: Optional[float] = None
+                        ) -> Tuple[sparse.csr_matrix, float]:
     """
     Builds the weighted adjaceny matrix W from the nodes and edges.
 
@@ -62,7 +67,7 @@ def build_weighted_matrix(coords, k = 16, sigma = None):
     rows = edge_index[:,0]
     cols = edge_index[:,1]
 
-    W = sparse.coo_matrix((weights, (rows, cols)), shape = (n, n))
+    W = sparse.coo_matrix((weights, (rows, cols)), shape=(n, n))
 
     W = W.maximum(W.T)
 
@@ -71,7 +76,7 @@ def build_weighted_matrix(coords, k = 16, sigma = None):
 
     return W.tocsr(), sigma
 
-def build_degree_matrix(W):
+def build_degree_matrix(W: sparse.spmatrix) -> Tuple[sparse.csr_matrix, np.ndarray]:
     """
     Build sparse degree matrix D from weighted adjacency matrix W.
 
@@ -87,7 +92,7 @@ def build_degree_matrix(W):
 
     return D, degrees
 
-def get_graph_laplacian(W):
+def get_graph_laplacian(W: sparse.spmatrix) -> sparse.csr_matrix:
     """
     Builds the Graph Laplacian from the degree Matrix D and the weighted adjacency matrix W.
 
@@ -98,16 +103,16 @@ def get_graph_laplacian(W):
         L: sparse normalized graph Laplacian of shape [N, N]
     """
     D, degrees = build_degree_matrix(W)
-    I = sparse.eye(W.shape[0], format = "csr")
+    I = sparse.eye(W.shape[0], format="csr")
 
     inverse_sqrt = 1.0 / np.sqrt(np.maximum(degrees, 1e-12))
-    D_inverse_sqrt = sparse.diags(inverse_sqrt, format = "csr")
+    D_inverse_sqrt = sparse.diags(inverse_sqrt, format="csr")
 
     L = I - D_inverse_sqrt @ W @ D_inverse_sqrt
 
     return L.tocsr()
 
-def spectral_decomposition(L, num_modes = 256):
+def spectral_decomposition(L: sparse.csr_matrix, num_modes: int = 256) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute the first num_modes eigenvalues/eigenvectors of the graph Laplacian.
 
@@ -127,7 +132,7 @@ def spectral_decomposition(L, num_modes = 256):
     if k <= 0:
         raise ValueError(f"Graph is too small for sparse eigendecomposition. Got n={n}.")
 
-    eigenvals, U = eigsh(L, k = k, which = "SM")
+    eigenvals, U = eigsh(L, k=k, which="SM")
 
     order = np.argsort(eigenvals)
     eigenvals = eigenvals[order]
@@ -135,7 +140,11 @@ def spectral_decomposition(L, num_modes = 256):
 
     return eigenvals, U
 
-def make_graph_frequency_bands(eigenvalues, exclude_zero=True, split="thirds"):
+def make_graph_frequency_bands(
+                            eigenvalues: np.ndarray,
+                            exclude_zero: bool = True,
+                            split: str = "thirds"
+                            ) -> Dict[str, np.ndarray]:
     """
     Split sorted graph frequencies into low/mid/high index bands.
 
@@ -163,5 +172,3 @@ def make_graph_frequency_bands(eigenvalues, exclude_zero=True, split="thirds"):
     }
 
     return bands
-
-
