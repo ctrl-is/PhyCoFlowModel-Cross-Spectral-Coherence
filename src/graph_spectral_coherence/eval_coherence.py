@@ -20,7 +20,7 @@ from model_finetune import (
     load_source_config,
 )
 
-from graph import make_graph_frequency_bands
+from graph_spectral_coherence.graph_basis import make_graph_frequency_bands
 
 from cross_spectral import (
     gft,

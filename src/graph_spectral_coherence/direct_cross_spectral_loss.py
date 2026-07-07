@@ -19,7 +19,7 @@ try:
         compute_physical_coherence_loss,
         gft,
     )
-    from .graph import make_graph_frequency_bands
+    from .graph_basis import make_graph_frequency_bands
 except ImportError:
     from cross_spectral import (
         CrossSpectralConfig,
@@ -27,7 +27,7 @@ except ImportError:
         compute_physical_coherence_loss,
         gft,
     )
-    from graph import make_graph_frequency_bands
+    from graph_spectral_coherence.graph_basis import make_graph_frequency_bands
 
 
 FieldPair = tuple[int, int]
