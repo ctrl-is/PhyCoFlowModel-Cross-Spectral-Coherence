@@ -1,1 +1,0 @@
-# Test the coherence on a fully trained model

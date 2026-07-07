@@ -44,10 +44,10 @@ def build_knn_edges(coords: np.ndarray, k: int = 16) -> Tuple[np.ndarray, np.nda
     return edge_index, dists
 
 def build_weighted_matrix(
-                        coords: np.ndarray, 
-                        k: int = 16, 
-                        sigma: Optional[float] = None
-                        ) -> Tuple[sparse.csr_matrix, float]:
+        coords: np.ndarray, 
+        k: int = 16, 
+        sigma: Optional[float] = None
+        ) -> Tuple[sparse.csr_matrix, float]:
     """
     Builds the weighted adjaceny matrix W from the nodes and edges.
 
@@ -141,10 +141,10 @@ def spectral_decomposition(L: sparse.csr_matrix, num_modes: int = 256) -> Tuple[
     return eigenvals, U
 
 def make_graph_frequency_bands(
-                            eigenvalues: np.ndarray,
-                            exclude_zero: bool = True,
-                            split: str = "thirds"
-                            ) -> Dict[str, np.ndarray]:
+        eigenvalues: np.ndarray,
+        exclude_zero: bool = True,
+        split: str = "thirds"
+        ) -> Dict[str, np.ndarray]:
     """
     Split sorted graph frequencies into low/mid/high index bands.
 

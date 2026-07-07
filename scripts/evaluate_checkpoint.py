@@ -1,1 +1,0 @@
-# Evaluate the coherence at every checkpoint/epoch
