@@ -1,10 +1,21 @@
-"""
-Differentiable cross-spectral objective for direct FFM post-training.
-Refactored directly from src.direct_coherence_loss.py
+"""Differentiable direct cross-spectral coherence utilities for PointCloudFFM post-training.
+
+This module preserves the original direct post-training pipeline:
+- point selection helpers
+- differentiable RF rollout
+- observation-consistency handling
+- weighted-sum / ConFIG optimizer updates
+- gradient diagnostics
+
+Only the physical-coherence objective is replaced with graph cross-spectral
+coherence.
+
+Sidenote: must change train_pointcloud_ffm.py to use this
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -12,43 +23,34 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 
-try:
-    from .cross_spectral import (
-        CrossSpectralConfig,
-        compute_band_energy,
-        compute_physical_coherence_loss,
-        gft,
-    )
-    from .graph_basis import make_graph_frequency_bands
-except ImportError:
-    from cross_spectral import (
-        CrossSpectralConfig,
-        compute_band_energy,
-        compute_physical_coherence_loss,
-        gft,
-    )
-    from graph_spectral_coherence.graph_basis import make_graph_frequency_bands
+from cross_spectral.cross_spectral import (
+    CrossSpectralConfig,
+    compute_band_energy,
+    compute_physical_coherence_loss,
+    gft,
+)
+from cross_spectral.graph import make_graph_frequency_bands
+from obs_consistency import (
+    apply_endpoint_observation_consistency,
+    build_pointwise_observation_maps,
+    build_smooth_observation_maps,
+    normalize_obs_consistency_mode,
+    scatter_observed_values,
+)
 
 
 FieldPair = tuple[int, int]
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
 @dataclass
 class DirectCrossSpectralConfig:
-    """Configuration for direct CSC post-training."""
+    """Configuration for differentiable direct CSC post-training."""
 
     enabled: bool = False
-
-    # Loss-component weights inside the physical coherence objective.
     samefreq_weight: float = 1.0
     crossfreq_weight: float = 1.0
 
-    # Optional scale-resolved field-energy objective.
-    # Keep this at 0.0 for the first experiment.
+    # Optional scale-resolved energy term.
     band_energy_weight: float = 0.0
     band_energy_use_log: bool = True
 
@@ -57,39 +59,32 @@ class DirectCrossSpectralConfig:
 
     # Evaluate in physical units when True.
     use_denorm: bool = False
-
-    eps: float = 1e-8
+    eps: float = 1.0e-8
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-# =============================================================================
-# Validation helpers
-# =============================================================================
-
 def _zero_like_scalar(x: torch.Tensor) -> torch.Tensor:
-    """Return a differentiable scalar zero."""
+    """Return a scalar zero that remains connected to autograd."""
     return x.sum() * 0.0
 
 
 def _require_finite(name: str, value: torch.Tensor) -> None:
     if not torch.isfinite(value).all():
-        raise FloatingPointError(
-            f"{name} contains NaN or Inf values."
-        )
+        raise FloatingPointError(f"{name} contains NaN or Inf values.")
 
 
 def _normalize_field_pairs(
     field_pairs: Optional[Sequence[FieldPair]],
     n_fields: int,
 ) -> Optional[list[FieldPair]]:
-    """Validate and deduplicate configured field pairs."""
+    """Validate, canonicalize, and deduplicate configured field pairs."""
     if field_pairs is None:
         return None
 
-    normalized = []
-    seen = set()
+    normalized: list[FieldPair] = []
+    seen: set[FieldPair] = set()
 
     for raw_pair in field_pairs:
         if len(raw_pair) != 2:
@@ -106,17 +101,13 @@ def _normalize_field_pairs(
                 f"Field pair {(i, j)} contains the same field twice."
             )
 
-        if not (
-            0 <= i < n_fields
-            and 0 <= j < n_fields
-        ):
+        if not (0 <= i < n_fields and 0 <= j < n_fields):
             raise ValueError(
                 f"Field pair {(i, j)} is outside the valid "
                 f"range [0, {n_fields})."
             )
 
         pair = tuple(sorted((i, j)))
-
         if pair not in seen:
             normalized.append(pair)
             seen.add(pair)
@@ -129,26 +120,14 @@ def _normalize_field_pairs(
     return normalized
 
 
-# =============================================================================
-# Existing graph-basis loader
-# =============================================================================
-
 def load_cross_spectral_graph_basis(
     graph_basis_path: str | Path,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """
-    Load the graph basis already produced by build_graph_basis.py.
-
-    Expected keys:
-        U
-        eigenvalues
-    """
+    """Load and validate a graph basis produced by build_graph_basis.py."""
     path = Path(graph_basis_path)
 
     if not path.exists():
-        raise FileNotFoundError(
-            f"Graph basis not found: {path}"
-        )
+        raise FileNotFoundError(f"Graph basis not found: {path}")
 
     graph_obj = torch.load(
         path,
@@ -160,22 +139,14 @@ def load_cross_spectral_graph_basis(
         raise TypeError(
             "Expected the graph-basis file to contain a dictionary."
         )
-
     if "U" not in graph_obj:
-        raise KeyError(
-            "Graph-basis file does not contain 'U'."
-        )
-
+        raise KeyError("Graph-basis file does not contain 'U'.")
     if "eigenvalues" not in graph_obj:
         raise KeyError(
             "Graph-basis file does not contain 'eigenvalues'."
         )
 
-    U = torch.as_tensor(
-        graph_obj["U"],
-        dtype=torch.float32,
-    )
-
+    U = torch.as_tensor(graph_obj["U"], dtype=torch.float32)
     eigenvalues = torch.as_tensor(
         graph_obj["eigenvalues"],
         dtype=torch.float32,
@@ -185,13 +156,11 @@ def load_cross_spectral_graph_basis(
         raise ValueError(
             f"Expected U with shape [N,K], got {tuple(U.shape)}."
         )
-
     if eigenvalues.ndim != 1:
         raise ValueError(
             "Expected eigenvalues with shape [K], "
             f"got {tuple(eigenvalues.shape)}."
         )
-
     if U.shape[1] != eigenvalues.shape[0]:
         raise ValueError(
             "Graph mode mismatch: "
@@ -204,12 +173,8 @@ def load_cross_spectral_graph_basis(
         exclude_zero=True,
         split="thirds",
     )
-
     bands = {
-        str(name): torch.as_tensor(
-            indices,
-            dtype=torch.long,
-        )
+        str(name): torch.as_tensor(indices, dtype=torch.long)
         for name, indices in generated_bands.items()
     }
 
@@ -226,45 +191,23 @@ def load_cross_spectral_graph_basis(
     return U, bands
 
 
-# =============================================================================
-# Differentiable band-energy term
-# =============================================================================
-
 def _compute_mean_band_energies(
     fields: torch.Tensor,
     U: torch.Tensor,
     bands: dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    """
-    Compute mean band energy for every field.
-
-    Args:
-        fields: [B,N,C]
-        U: [N,K]
-        bands: graph-frequency band indices
-
-    Returns:
-        [M,C], where M is the number of bands.
-    """
+    """Return mean energy per graph-frequency band and physical field."""
     coefficients = gft(fields, U)
-
     energies = []
 
-    for band_name, band_indices in bands.items():
+    for band_indices in bands.values():
         energy_per_snapshot = compute_band_energy(
             coefficients,
             band_indices,
         )
+        energies.append(energy_per_snapshot.mean(dim=0))
 
-        # [B,C] -> [C]
-        mean_energy = energy_per_snapshot.mean(dim=0)
-
-        energies.append(mean_energy)
-
-    return torch.stack(
-        energies,
-        dim=0,
-    )
+    return torch.stack(energies, dim=0)
 
 
 def differentiable_band_energy_loss(
@@ -272,21 +215,15 @@ def differentiable_band_energy_loss(
     fields_target: torch.Tensor,
     U: torch.Tensor,
     bands: dict[str, torch.Tensor],
-    eps: float = 1e-8,
+    eps: float = 1.0e-8,
     use_log: bool = True,
 ) -> torch.Tensor:
-    """
-    Compare predicted and target scale-resolved field energies.
-
-    The ratio used in evaluation plots is not optimized directly because
-    ratios can become unstable when the target energy is nearly zero.
-    """
+    """Compare predicted and target scale-resolved field energies."""
     energy_pred = _compute_mean_band_energies(
         fields_pred,
         U,
         bands,
     )
-
     energy_target = _compute_mean_band_energies(
         fields_target,
         U,
@@ -300,38 +237,15 @@ def differentiable_band_energy_loss(
         )
     else:
         denominator = energy_target.abs().clamp_min(eps)
-
-        difference = (
-            energy_pred - energy_target
-        ) / denominator
+        difference = (energy_pred - energy_target) / denominator
 
     loss = difference.square().mean()
-
-    _require_finite(
-        "band_energy_loss",
-        loss,
-    )
-
+    _require_finite("band_energy_loss", loss)
     return loss
 
 
-# =============================================================================
-# Direct CSC loss
-# =============================================================================
-
 class DirectCrossSpectralCoherenceLoss(nn.Module):
-    """
-    Direct cross-spectral objective for generated terminal fields.
-
-    Both inputs must be complete fields with shape:
-
-        [B,N,C]
-
-    N must equal the node count in the stored graph basis.
-
-    The same-frequency and cross-frequency estimators require multiple
-    distinct samples in the batch. A batch size of one is not meaningful.
-    """
+    """Differentiable CSC objective for complete generated fields [B,N,C]."""
 
     def __init__(
         self,
@@ -340,60 +254,35 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
         bands: dict[str, torch.Tensor],
     ) -> None:
         super().__init__()
-
         self.cfg = cfg
 
-        U = torch.as_tensor(
-            U,
-            dtype=torch.float32,
-        )
-
+        U = torch.as_tensor(U, dtype=torch.float32)
         if U.ndim != 2:
             raise ValueError(
                 f"Expected U with shape [N,K], got {tuple(U.shape)}."
             )
 
-        # The basis is fixed and should not receive gradients.
-        # persistent=False avoids copying the large basis into a loss state_dict.
-        self.register_buffer(
-            "U",
-            U,
-            persistent=False,
-        )
+        self.register_buffer("U", U, persistent=False)
+        self._band_names: list[str] = []
 
-        self._band_names = []
-
-        for position, (name, indices) in enumerate(
-            bands.items()
-        ):
-            indices = torch.as_tensor(
-                indices,
-                dtype=torch.long,
-            )
-
+        for position, (name, indices) in enumerate(bands.items()):
+            indices = torch.as_tensor(indices, dtype=torch.long)
             if indices.ndim != 1 or indices.numel() == 0:
                 raise ValueError(
                     f"Band {name!r} must contain a nonempty "
                     "one-dimensional index tensor."
                 )
-
             self.register_buffer(
                 f"_band_indices_{position}",
                 indices,
                 persistent=False,
             )
-
             self._band_names.append(str(name))
 
     def _bands(self) -> dict[str, torch.Tensor]:
         return {
-            name: getattr(
-                self,
-                f"_band_indices_{position}",
-            )
-            for position, name in enumerate(
-                self._band_names
-            )
+            name: getattr(self, f"_band_indices_{position}")
+            for position, name in enumerate(self._band_names)
         }
 
     def _maybe_denormalize(
@@ -415,7 +304,6 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
             device=x_gen.device,
             dtype=x_gen.dtype,
         ).view(1, 1, -1)
-
         std = std.to(
             device=x_gen.device,
             dtype=x_gen.dtype,
@@ -429,10 +317,7 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
                 "All field standard deviations must be positive."
             )
 
-        return (
-            x_gen * std + mean,
-            x_ref * std + mean,
-        )
+        return x_gen * std + mean, x_ref * std + mean
 
     def forward(
         self,
@@ -446,16 +331,14 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
                 "Direct CSC expects [B,N,C] fields, got "
                 f"{tuple(x_gen.shape)} and {tuple(x_ref.shape)}."
             )
-
         if x_gen.shape != x_ref.shape:
             raise ValueError(
                 "Generated/reference shape mismatch: "
                 f"{tuple(x_gen.shape)} versus {tuple(x_ref.shape)}."
             )
-
         if x_gen.shape[1] != self.U.shape[0]:
             raise ValueError(
-                "The direct CSC objective requires the complete graph. "
+                "Direct CSC requires the complete graph. "
                 f"Fields have N={x_gen.shape[1]}, while U has "
                 f"N={self.U.shape[0]}."
             )
@@ -473,12 +356,9 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
                 "total_loss": zero,
             }
 
-        # Your spectral estimators compare statistics across the batch.
         if x_gen.shape[0] < 2:
             raise ValueError(
-                "Direct cross-spectral training requires batch_size >= 2. "
-                "With B=1, centered cross-band energies are zero and "
-                "same-frequency coherence becomes degenerate."
+                "Direct CSC training requires batch_size >= 2."
             )
 
         x_gen, x_ref = self._maybe_denormalize(
@@ -488,12 +368,8 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
             std,
         )
 
-        U = self.U.to(
-            dtype=x_gen.dtype
-        )
-
+        U = self.U.to(dtype=x_gen.dtype)
         bands = self._bands()
-
         field_pairs = _normalize_field_pairs(
             self.cfg.field_pairs,
             n_fields=x_gen.shape[-1],
@@ -516,45 +392,26 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
         samefreq_loss = outputs["L_same"]
         crossfreq_loss = outputs["L_crossfreq"]
 
-        _require_finite(
-            "samefreq_loss",
-            samefreq_loss,
-        )
-
-        _require_finite(
-            "crossfreq_loss",
-            crossfreq_loss,
-        )
+        _require_finite("samefreq_loss", samefreq_loss)
+        _require_finite("crossfreq_loss", crossfreq_loss)
 
         band_energy_loss = zero
-
         if float(self.cfg.band_energy_weight) != 0.0:
-            # Recompute instead of using outputs["auto_spectra_pred"],
-            # because cross_spectral.py detaches those diagnostics.
             band_energy_loss = differentiable_band_energy_loss(
                 fields_pred=x_gen,
                 fields_target=x_ref,
                 U=U,
                 bands=bands,
                 eps=float(self.cfg.eps),
-                use_log=bool(
-                    self.cfg.band_energy_use_log
-                ),
+                use_log=bool(self.cfg.band_energy_use_log),
             )
 
         total_loss = (
-            float(self.cfg.samefreq_weight)
-            * samefreq_loss
-            + float(self.cfg.crossfreq_weight)
-            * crossfreq_loss
-            + float(self.cfg.band_energy_weight)
-            * band_energy_loss
+            float(self.cfg.samefreq_weight) * samefreq_loss
+            + float(self.cfg.crossfreq_weight) * crossfreq_loss
+            + float(self.cfg.band_energy_weight) * band_energy_loss
         )
-
-        _require_finite(
-            "total_loss",
-            total_loss,
-        )
+        _require_finite("total_loss", total_loss)
 
         return total_loss, {
             "samefreq_loss": samefreq_loss,
@@ -564,74 +421,345 @@ class DirectCrossSpectralCoherenceLoss(nn.Module):
         }
 
 
-# =============================================================================
-# Constructor
-# =============================================================================
-
 def build_direct_cross_spectral_loss(
     cfg: DirectCrossSpectralConfig,
     graph_basis_path: str | Path,
     device: torch.device | str,
 ) -> DirectCrossSpectralCoherenceLoss:
-    U, bands = load_cross_spectral_graph_basis(
-        graph_basis_path
-    )
-
+    """Build the CSC loss while preserving the original training utilities."""
+    U, bands = load_cross_spectral_graph_basis(graph_basis_path)
     module = DirectCrossSpectralCoherenceLoss(
         cfg=cfg,
         U=U,
         bands=bands,
     )
-
     return module.to(device)
 
 
-# =============================================================================
-# Gradient test
-# =============================================================================
+def sample_coherence_points(
+    coords: torch.Tensor,
+    fields: torch.Tensor,
+    n_points: Optional[int],
+    generator: Optional[torch.Generator] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Uniformly subsample empirical field points for coherence evaluation."""
+    if coords.ndim != 3 or fields.ndim != 3:
+        raise ValueError(f"coords and fields must be [B, N, *], got {tuple(coords.shape)} and {tuple(fields.shape)}")
+    if coords.shape[:2] != fields.shape[:2]:
+        raise ValueError(f"coords/fields point shape mismatch: {tuple(coords.shape)} vs {tuple(fields.shape)}")
+    if n_points is None or int(n_points) >= coords.shape[1]:
+        return coords, fields, None
+
+    bsz, n_total, coord_dim = coords.shape
+    n_select = max(1, int(n_points))
+    indices = []
+    for _ in range(bsz):
+        indices.append(torch.randperm(n_total, device=coords.device, generator=generator)[:n_select].sort().values)
+    idx = torch.stack(indices, dim=0)
+    coord_idx = idx.unsqueeze(-1).expand(-1, -1, coord_dim)
+    field_idx = idx.unsqueeze(-1).expand(-1, -1, fields.shape[-1])
+    return torch.gather(coords, 1, coord_idx), torch.gather(fields, 1, field_idx), idx
+
+
+def _call_velocity_model(
+    ffm_model: nn.Module,
+    t: torch.Tensor,
+    x_t: torch.Tensor,
+    coords: torch.Tensor,
+    obs_coords: torch.Tensor,
+    obs_values: torch.Tensor,
+    obs_mask: torch.Tensor,
+    obs_field_ids: torch.Tensor,
+    obs_indices: Optional[torch.Tensor],
+) -> torch.Tensor:
+    kwargs = {
+        "t": t,
+        "x_t": x_t,
+        "coords": coords,
+        "obs_coords": obs_coords,
+        "obs_values": obs_values,
+        "obs_mask": obs_mask,
+        "obs_field_ids": obs_field_ids,
+    }
+    if getattr(ffm_model, "requires_full_grid", False):
+        if obs_indices is None:
+            raise ValueError("This FFM model requires full-grid obs_indices for velocity calls.")
+        kwargs["obs_indices"] = obs_indices
+    return ffm_model.model(**kwargs)
+
+
+def _validate_pointwise_indices(
+    coords: torch.Tensor,
+    obs_indices: Optional[torch.Tensor],
+    mode: str,
+) -> None:
+    if mode not in ("default_hard", "endpoint"):
+        return
+    if obs_indices is None:
+        raise ValueError(f"obs_consistency_mode={mode!r} requires obs_indices.")
+    valid = obs_indices >= 0
+    if torch.any(valid & (obs_indices >= coords.shape[1])):
+        raise ValueError(
+            f"obs_consistency_mode={mode!r} requires obs_indices valid for the rollout coordinate set. "
+            "Use endpoint_smooth for point-subset coherence rollouts."
+        )
+
+
+def differentiable_rf_rollout(
+    ffm_model: nn.Module,
+    coords: torch.Tensor,
+    obs_coords: torch.Tensor,
+    obs_values: torch.Tensor,
+    obs_mask: torch.Tensor,
+    obs_field_ids: torch.Tensor,
+    obs_indices: Optional[torch.Tensor],
+    n_steps: int = 2,
+    ode_solver: str = "euler",
+    obs_consistency_mode: str = "endpoint_smooth",
+    obs_consistency_strength: float = 1.0,
+    obs_consistency_sigma: float = 0.05,
+    obs_consistency_schedule_power: float = 2.0,
+    obs_consistency_final_clamp: bool = True,
+) -> torch.Tensor:
+    """Differentiable terminal rollout for direct coherence training."""
+    if n_steps < 1:
+        raise ValueError(f"n_steps must be >= 1, got {n_steps}")
+    if ode_solver not in ("euler", "heun"):
+        raise ValueError(f"Unsupported ode_solver={ode_solver!r}; expected 'euler' or 'heun'.")
+    if getattr(ffm_model, "requires_full_grid", False):
+        if obs_indices is None:
+            raise ValueError("Full-grid FFM rollouts require obs_indices.")
+        if coords.shape[1] != int(getattr(ffm_model.model, "Num_x", 0)) * int(getattr(ffm_model.model, "Num_y", 0)):
+            raise ValueError("Full-grid FFM rollouts require full-grid coordinates.")
+
+    mode = normalize_obs_consistency_mode(obs_consistency_mode)
+    _validate_pointwise_indices(coords, obs_indices, mode)
+
+    bsz = coords.shape[0]
+    x = ffm_model.sample_source(coords)
+    value_map = None
+    mask_map = None
+    if mode == "endpoint":
+        value_map, mask_map = build_pointwise_observation_maps(
+            coords=coords,
+            obs_values=obs_values,
+            obs_mask=obs_mask,
+            obs_indices=obs_indices,
+            obs_field_ids=obs_field_ids,
+            n_fields=ffm_model.model.n_fields,
+        )
+    elif mode == "endpoint_smooth":
+        value_map, mask_map = build_smooth_observation_maps(
+            coords=coords,
+            obs_coords=obs_coords,
+            obs_values=obs_values,
+            obs_mask=obs_mask,
+            obs_field_ids=obs_field_ids,
+            n_fields=ffm_model.model.n_fields,
+            sigma=float(obs_consistency_sigma),
+        )
+
+    ts = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=coords.device, dtype=coords.dtype)
+    for i in range(int(n_steps)):
+        t0 = ts[i].expand(bsz)
+        dt = ts[i + 1] - ts[i]
+        v0 = _call_velocity_model(
+            ffm_model, t0, x, coords, obs_coords, obs_values, obs_mask, obs_field_ids, obs_indices
+        )
+        if mode in ("endpoint", "endpoint_smooth"):
+            v0 = apply_endpoint_observation_consistency(
+                x_t=x,
+                v=v0,
+                t=t0,
+                value_map=value_map,
+                mask_map=mask_map,
+                strength=obs_consistency_strength,
+                schedule_power=obs_consistency_schedule_power,
+            )
+
+        if ode_solver == "heun":
+            x_euler = x + dt * v0
+            t1 = ts[i + 1].expand(bsz)
+            v1 = _call_velocity_model(
+                ffm_model, t1, x_euler, coords, obs_coords, obs_values, obs_mask, obs_field_ids, obs_indices
+            )
+            if mode in ("endpoint", "endpoint_smooth") and float(ts[i + 1].item()) < 1.0:
+                v1 = apply_endpoint_observation_consistency(
+                    x_t=x_euler,
+                    v=v1,
+                    t=t1,
+                    value_map=value_map,
+                    mask_map=mask_map,
+                    strength=obs_consistency_strength,
+                    schedule_power=obs_consistency_schedule_power,
+                )
+            x = x + 0.5 * dt * (v0 + v1)
+        else:
+            x = x + dt * v0
+
+        if mode == "default_hard":
+            x = scatter_observed_values(x, obs_values, obs_mask, obs_indices, obs_field_ids, strength=1.0)
+
+    if obs_consistency_final_clamp and mode != "none" and obs_indices is not None:
+        valid = obs_indices >= 0
+        indices_fit_current_coords = not torch.any(valid & (obs_indices >= coords.shape[1]))
+        if indices_fit_current_coords:
+            x = scatter_observed_values(x, obs_values, obs_mask, obs_indices, obs_field_ids, strength=1.0)
+    return x
+
+
+def _gradient_vector_from_model(model: nn.Module) -> torch.Tensor:
+    pieces = []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if param.grad is None:
+            pieces.append(torch.zeros_like(param).reshape(-1))
+        else:
+            pieces.append(param.grad.reshape(-1))
+    if not pieces:
+        raise RuntimeError("No trainable parameters found for gradient diagnostics.")
+    return torch.cat(pieces)
+
+
+def _weighted_sum_update(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    data_loss: torch.Tensor,
+    coherence_loss: torch.Tensor,
+    data_weight: float,
+    coherence_weight: float,
+    grad_clip_norm: Optional[float],
+) -> dict:
+    optimizer.zero_grad(set_to_none=True)
+    total_loss = float(data_weight) * data_loss + float(coherence_weight) * coherence_loss
+    total_loss.backward()
+    grad_vec = _gradient_vector_from_model(model)
+    if not torch.isfinite(grad_vec).all():
+        raise FloatingPointError("Weighted-sum gradient contains NaN or Inf values.")
+    if grad_clip_norm is not None and float(grad_clip_norm) > 0:
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+    optimizer.step()
+    norm = torch.linalg.vector_norm(grad_vec.detach())
+    return {
+        "data_grad_norm": float("nan"),
+        "coherence_grad_norm": float("nan"),
+        "gradient_cosine": float("nan"),
+        "gradient_conflict": False,
+        "config_fallback_used": False,
+        "combined_grad_norm": float(norm.detach().cpu()),
+    }
+
+
+def apply_two_objective_update(
+    model,
+    optimizer,
+    data_loss,
+    coherence_loss,
+    mode,
+    data_weight,
+    coherence_weight,
+    grad_clip_norm,
+    config_missing_behavior="error",
+) -> dict:
+    """Apply weighted-sum or ConFIG two-objective update.
+
+    In ``config`` mode, ``data_weight`` and ``coherence_weight`` are optional
+    gradient pre-scales before the conflict-free update. Manual relative tuning
+    should usually be done with ``weighted_sum`` mode.
+    """
+    mode = str(mode or "weighted_sum").strip().lower()
+    if mode == "weighted_sum":
+        return _weighted_sum_update(
+            model, optimizer, data_loss, coherence_loss, data_weight, coherence_weight, grad_clip_norm
+        )
+    if mode != "config":
+        raise ValueError("gradient_balance_mode must be 'weighted_sum' or 'config'.")
+
+    try:
+        from conflictfree.grad_operator import ConFIG_update
+        from conflictfree.utils import apply_gradient_vector, get_gradient_vector
+    except ImportError as exc:
+        if str(config_missing_behavior) == "weighted_sum":
+            warnings.warn(
+                "conflictfree is not installed; falling back to weighted_sum. "
+                "Install with: pip install conflictfree",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return _weighted_sum_update(
+                model, optimizer, data_loss, coherence_loss, data_weight, coherence_weight, grad_clip_norm
+            )
+        raise ImportError(
+            "gradient_balance_mode='config' requires the optional conflictfree package. "
+            "Install with: pip install conflictfree"
+        ) from exc
+
+    optimizer.zero_grad(set_to_none=True)
+    (float(data_weight) * data_loss).backward()
+    g_data = get_gradient_vector(model)
+    optimizer.zero_grad(set_to_none=True)
+    (float(coherence_weight) * coherence_loss).backward()
+    g_coherence = get_gradient_vector(model)
+
+    data_ok = torch.isfinite(g_data).all()
+    coherence_ok = torch.isfinite(g_coherence).all()
+    data_norm = torch.linalg.vector_norm(g_data.detach())
+    coherence_norm = torch.linalg.vector_norm(g_coherence.detach())
+    denom = (data_norm * coherence_norm).clamp_min(1e-12)
+    cosine = torch.dot(g_data.detach().reshape(-1), g_coherence.detach().reshape(-1)) / denom
+
+    optimizer.zero_grad(set_to_none=True)
+    fallback = False
+    if not data_ok:
+        raise FloatingPointError("Data gradient contains NaN or Inf values.")
+    if (not coherence_ok) or float(coherence_norm.detach().cpu()) == 0.0:
+        warnings.warn("Invalid or zero coherence gradient; falling back to data gradient.", RuntimeWarning, stacklevel=2)
+        apply_gradient_vector(model, g_data)
+        fallback = True
+    else:
+        g_config = ConFIG_update([g_data, g_coherence])
+        if not torch.isfinite(g_config).all():
+            warnings.warn("ConFIG gradient was invalid; falling back to data gradient.", RuntimeWarning, stacklevel=2)
+            apply_gradient_vector(model, g_data)
+            fallback = True
+        else:
+            apply_gradient_vector(model, g_config)
+
+    if grad_clip_norm is not None and float(grad_clip_norm) > 0:
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+    optimizer.step()
+    return {
+        "data_grad_norm": float(data_norm.detach().cpu()),
+        "coherence_grad_norm": float(coherence_norm.detach().cpu()),
+        "gradient_cosine": float(cosine.detach().cpu()),
+        "gradient_conflict": bool(float(cosine.detach().cpu()) < 0.0),
+        "config_fallback_used": fallback,
+    }
+
 
 def gradient_sanity_check(
+    graph_basis_path: str | Path,
     device: str | torch.device = "cpu",
 ) -> bool:
-    """Check that the CSC objective produces a finite nonzero gradient."""
+    """Check that the CSC objective backpropagates to generated fields."""
     device = torch.device(device)
-
-    batch_size = 4
-    n_points = 24
-    n_modes = 12
-    n_fields = 4
+    U, bands = load_cross_spectral_graph_basis(graph_basis_path)
+    U = U.to(device)
 
     x_gen = torch.randn(
-        batch_size,
-        n_points,
-        n_fields,
+        4,
+        U.shape[0],
+        5,
         device=device,
         requires_grad=True,
     )
-
     x_ref = torch.randn(
-        batch_size,
-        n_points,
-        n_fields,
+        4,
+        U.shape[0],
+        5,
         device=device,
     )
-
-    random_basis = torch.randn(
-        n_points,
-        n_modes,
-        device=device,
-    )
-
-    U, _ = torch.linalg.qr(
-        random_basis,
-        mode="reduced",
-    )
-
-    bands = {
-        "low": torch.arange(1, 4, device=device),
-        "mid": torch.arange(4, 8, device=device),
-        "high": torch.arange(8, 12, device=device),
-    }
 
     cfg = DirectCrossSpectralConfig(
         enabled=True,
@@ -639,74 +767,30 @@ def gradient_sanity_check(
         crossfreq_weight=1.0,
         band_energy_weight=0.0,
     )
-
     loss_module = DirectCrossSpectralCoherenceLoss(
         cfg=cfg,
         U=U,
         bands=bands,
     ).to(device)
 
-    loss, components = loss_module(
-        x_gen=x_gen,
-        x_ref=x_ref,
-    )
-
+    loss, _ = loss_module(x_gen=x_gen, x_ref=x_ref)
     loss.backward()
 
-    valid = bool(
+    return bool(
         x_gen.grad is not None
         and torch.isfinite(x_gen.grad).all()
         and torch.linalg.vector_norm(x_gen.grad).item() > 0.0
     )
 
-    print(
-        "samefreq_loss:",
-        float(
-            components["samefreq_loss"]
-            .detach()
-            .cpu()
-        ),
-    )
-
-    print(
-        "crossfreq_loss:",
-        float(
-            components["crossfreq_loss"]
-            .detach()
-            .cpu()
-        ),
-    )
-
-    print(
-        "total_loss:",
-        float(
-            components["total_loss"]
-            .detach()
-            .cpu()
-        ),
-    )
-
-    print(
-        "gradient_norm:",
-        (
-            float(
-                torch.linalg.vector_norm(x_gen.grad)
-                .detach()
-                .cpu()
-            )
-            if x_gen.grad is not None
-            else 0.0
-        ),
-    )
-
-    return valid
-
 
 __all__ = [
     "DirectCrossSpectralConfig",
     "DirectCrossSpectralCoherenceLoss",
+    "apply_two_objective_update",
     "build_direct_cross_spectral_loss",
     "differentiable_band_energy_loss",
+    "differentiable_rf_rollout",
     "gradient_sanity_check",
     "load_cross_spectral_graph_basis",
+    "sample_coherence_points",
 ]
