@@ -1,0 +1,10 @@
+Demo_Num: 2
+source_Demo_Num: 1
+source_run_dir: null          # auto-resolved from source_Demo_Num
+source_checkpoint: "best"
+# data/static_nc inherited from source run config
+ram_epochs: 150
+batch_size: 2
+ram_endpoint_steps: 4
+ode_solver: "euler"
+save_dir: "Save_TrainedModel/cb_ram_finetune"
