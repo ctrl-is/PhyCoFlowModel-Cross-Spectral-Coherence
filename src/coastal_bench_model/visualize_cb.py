@@ -94,9 +94,15 @@ def visualize_reconstruction_cb(
 
     # ------------------------------------------------------------------
     # Colour limits
+    # grid_true/grid_pred contain np.nan for land cells; array .min()/.max()
+    # propagates NaN, so we must use np.nanmin/nanmax on each grid separately
+    # before combining, otherwise vmin/vmax can silently become NaN and the
+    # shared colorbar breaks (each panel auto-scales independently).
     # ------------------------------------------------------------------
-    vmin = float(np.nanmin([grid_true.min(), grid_pred.min()]))
-    vmax = float(np.nanmax([grid_true.max(), grid_pred.max()]))
+    vmin = float(np.nanmin([np.nanmin(grid_true), np.nanmin(grid_pred)]))
+    vmax = float(np.nanmax([np.nanmax(grid_true), np.nanmax(grid_pred)]))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        vmin, vmax = -1.0, 1.0   # fallback if all values are NaN
     if vmin == vmax:
         vmin -= 1e-6
         vmax += 1e-6

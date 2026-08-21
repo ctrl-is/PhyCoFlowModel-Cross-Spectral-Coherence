@@ -467,13 +467,24 @@ class CoastalBenchNCDataset(Dataset):
         Returns an array of shape (N_total, C) = (898*598, len(var_names)),
         dtype float32.  Land points are NOT yet masked here; masking happens
         in the caller.  NaN / fill values are replaced with 0.0.
+
+        Supports both full files (3-D vars have shape (ocean_time, s, eta, xi))
+        and pre-carved slim files produced by carve_cb_heavy.py (3-D vars have
+        shape (ocean_time, eta, xi), level already extracted at carve
+        time).  Detection is automatic via the variable's ndim.
         """
         slices = []
         for var in self.var_names:
             if var in CB_3D_VARS:
-                arr = ds[var][step_idx, self.var_level, :, :].values  # (898, 598)
+                arr_var = ds[var]
+                if arr_var.ndim == 4:
+                    # Full file: (ocean_time, s, eta, xi)
+                    arr = arr_var[step_idx, self.var_level, :, :].values  # (898, 598)
+                else:
+                    # Carved file: level already extracted → (ocean_time, eta, xi)
+                    arr = arr_var[step_idx, :, :].values                  # (898, 598)
             else:
-                arr = ds[var][step_idx, :, :].values                  # (898, 598)
+                arr = ds[var][step_idx, :, :].values                      # (898, 598)
             arr = arr.astype(np.float32)
             np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
             slices.append(arr.ravel())   # (898*598,)

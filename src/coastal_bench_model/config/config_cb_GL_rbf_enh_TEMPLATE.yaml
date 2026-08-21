@@ -1,0 +1,97 @@
+# TEMPLATE
+# Workflow:
+#   Carve a new subset with carve_cb_heavy.py (see header comments in that script).
+#   The script will print the exact YAML snippet to paste into sections.
+#   NOTE: wetdry_mask_rho is NOT a variable to paste into it, it is the land-sea mask.
+#
+#
+#
+#   Launch training:
+#        python src/train_cb.py --config Save_config/config_cb_GL_rbf_enh_DemoN<N>.yaml
+
+Demo_Num: 2   # CHANGE ME
+
+device_ids: [0]
+
+# ──────────────────────────────────────────────────────────
+# Dataset + fields of carved dataset
+# ──────────────────────────────────────────────────────────
+data:           "/home/alexis31/orcd/pool/CoastalBench/CB_2yr_uvtempsalt_wd"            # CHANGE
+static_nc:      "/home/alexis31/orcd/pool/CoastalBench/CB_2yr_uvtempsalt_wd/static.nc"  # CHANGE
+cb_var_names:   ['u', 'v', 'temp', 'salt']   # CHANGE ME to match subset vars
+cb_field_names: ["u_surf", "v_surf", "temp_surf", "salt_surf"]  # human names, same order
+cb_var_level:   11
+
+save_dir:   "Save_TrainedModel/cb_GL_rbf_enh_"
+
+# ──────────────────────────────────────────────────────────
+# Conditioning
+#   cond_fields is a 0-based index into cb_var_names.
+# ──────────────────────────────────────────────────────────
+cond_fields:    [2]         # CHANGE ME if conditioning on a different field
+n_obs_min_list: [32]
+n_obs_max_list: [256]
+vis_cond_fields: [0]
+vis_n_obs_list: [128]
+
+# ──────────────────────────────────────────────────────────
+# Standard training config.
+# ──────────────────────────────────────────────────────────
+RELOAD: false
+cb_use_wetdry_mask: true # important
+
+seed: 42
+epochs: 1000
+batch_size: 4
+lr: 1.0e-4
+weight_decay: 1.0e-5
+train_ratio: 0.85
+time_stride: 2
+num_workers: 4
+
+backbone: "GL_rbf_ENH"
+hidden_dim: 256
+cond_dim: 128
+field_embed_dim: 128
+rbf_sigma: 0.05
+sigma_min: 1.0e-4
+USE_FOURIER_PE: true
+fourier_pe_num_bands: 32
+fourier_pe_max_freq: 64.0
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.05
+mlp_dropout: 0.05
+summary_type: "mean"
+gather_mode: "topk_rbf_glres"
+gather_topk: 32
+sensor_local_topk: 16
+gather_query_chunk_size: 2048
+learnable_rbf_sigma: true
+neighbor_backend: "torch"
+sensor_local_dropout: 0.1
+sensor_coord_encoding: "fourier"
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: "coord"
+query_readout_scale_init: 1.0e-2
+enhanced_head_norm: true
+glres_scale_init: 1.0e-2
+
+n_query_points: 8192
+query_sampling: "obs_mix"
+query_sample_near_ratio: 0.25
+query_sample_far_ratio: 0.25
+query_sample_sigma_ratio: 0.05
+prior: "rff"
+rff_features: 256
+rff_lengthscale: 0.15
+eval_every: 10
+save_every: 100
+n_steps_generation: 16
+benchmark_n_steps: [2, 4, 8]
+ode_solver: "euler"
