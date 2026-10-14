@@ -1,0 +1,34 @@
+# CoastalBench base-training profile using the GL-RBF/CQ model.
+#
+# Dataset: 681 daily dates (2009-2010), ~150k always-wet ocean points,
+#          4 channels (u, v, temp, salt), 48 snapshots/day at 30-min resolution.
+#          HDF5: cb_dstuv_L0_681d_2009_2010daily_grid_h5/coastal_bench.h5
+#
+# Composition order: later files override earlier ones.
+defaults:
+  - ../../../../configs/defaults/base_training.yaml
+  - ../../../../configs/models/gl_rbf_cq.yaml
+  - ../sensors/v_temp_random_512_512.yaml
+  - ../dataset.yaml
+
+stage: base_training
+case: coastal_bench
+
+# Runtime overrides.
+runtime:
+  device: cuda:0
+  num_workers: 4
+  data_strategy: vram
+  seed: 42
+
+# Optimization overrides.
+# Lower lr than Kolmogorov (1e-4) to account for larger domain and sparser obs.
+optimization:
+  epochs: 5000
+  batch_size: 128
+  lr: 5.0e-5
+  weight_decay: 1.0e-6
+  grad_clip: 1.0
+
+output:
+  experiment_name: cb_gl_rbf_cq

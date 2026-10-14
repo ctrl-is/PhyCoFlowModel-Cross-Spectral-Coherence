@@ -1,0 +1,54 @@
+# CoastalBench coherence profile: global distribution plus graph cross-spectrum.
+# Topology is intentionally absent. The wet-point cloud is not the combustion lattice.
+
+# Composition order; later files override earlier defaults.
+defaults:
+  - global_distribution_demo50.yaml
+
+# Coherence schedule, compute budget, and statistical families.
+coherence:
+
+  # Coherence minibatch and query set. Cross-spectrum requires fixed_shared.
+  # Differentiable GL-RBF rollout at batch 128 OOMs on a 44 GB L40S.
+  # 16 still satisfies the cross-frequency ensemble minimum of 3.
+  compute_budget:
+    batch_size: 16
+    point_count: 4096
+    query_policy: fixed_shared  # choices: random_per_sample | fixed_shared
+    query_seed: 100045
+
+  # Enabled families: global_distribution | cross_spectrum.
+  families:
+
+    # Marginal, mutual, and cross-field distribution constraints.
+    global_distribution:
+      weight: 1.0
+
+    # Graph-spectrum alignment for configured field pairs.
+    cross_spectrum:
+      enabled: true
+      weight: 1.0
+      target_use: paired_supervised  # choices: training_reference | paired_supervised
+      units: model_units  # choices: model_units | physical_units
+      fields: [u, v, temp, salt]
+      pairs: [[u, v], [temp, salt], [u, temp], [v, salt]]
+
+      # Reference target cache; required for training_reference targets.
+      reference_bank: {enabled: false}
+
+      # Graph construction and retained spectral bands.
+      graph:
+        k_neighbors: 16
+        sigma: null
+        num_modes: 48
+        exclude_zero: true
+        bands: [low, mid, high]
+      eps: 1.0e-8
+
+      # Component enablement and relative weights.
+      components:
+        # Explicit per-field, modewise auto-spectrum matching.
+        self_spectrum: {enabled: true, weight: 1.0}
+        same_frequency: {enabled: true, weight: 1.0}
+        cross_frequency: {enabled: true, weight: 1.0}
+        band_energy: {enabled: false, weight: 0.0}
